@@ -4,7 +4,8 @@
       "Bash(python3 -m pytest tests/test_server.py -v)",
       "Bash(python3 -m venv .venv)",
       "Bash(.venv/bin/pip install *)",
-      "Bash(.venv/bin/pytest tests/test_server.py -v)"
+      "Bash(.venv/bin/pytest tests/test_server.py -v)",
+      "Bash(.venv/bin/pytest tests/test_server.py -q)"
     ]
   }
 }

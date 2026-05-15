@@ -243,6 +243,19 @@ def _valid_uid(uid: str) -> bool:
     return bool(uid) and uid.isdigit()
 
 
+_COPYUID_RE = re.compile(rb"\[COPYUID \d+ [\d,:]+ ([\d,:]+)\]")
+
+
+def _parse_copyuid(data: list) -> Optional[str]:
+    """Return the destination UID set string from a COPYUID response code, or
+    None if the code is absent (meaning no message was actually copied/moved)."""
+    if not data or not data[0]:
+        return None
+    raw = data[0] if isinstance(data[0], bytes) else str(data[0]).encode()
+    m = _COPYUID_RE.search(raw)
+    return m.group(1).decode() if m else None
+
+
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
 
 
@@ -312,12 +325,18 @@ def list_emails(
     if typ != "OK":
         return [{"error": f"Cannot open folder: {target}"}]
 
-    typ, data = conn.uid("search", None, "ALL")
-    if typ != "OK" or not data or not data[0]:
-        return []
-
-    uid_list = data[0].split()
-    uid_list = uid_list[-limit:][::-1]  # newest-UID-first
+    if "SORT" in conn.capabilities:
+        # Server-side sort by actual DATE — more accurate than UID order.
+        typ, data = conn.uid("sort", "(REVERSE DATE)", "UTF-8", "ALL")
+        if typ != "OK" or not data or not data[0]:
+            return []
+        uid_list = data[0].split()[:limit]
+    else:
+        # Fall back to UID order (ascending UIDs ≈ arrival order).
+        typ, data = conn.uid("search", None, "ALL")
+        if typ != "OK" or not data or not data[0]:
+            return []
+        uid_list = data[0].split()[-limit:][::-1]
 
     if not uid_list:
         return []
@@ -457,15 +476,23 @@ def move_mail(
     if typ != "OK":
         return {"error": f"Cannot open source folder: {src}"}
 
-    # Prefer RFC 6851 MOVE (atomic, no intermediate \Deleted state)
-    try:
+    # Pre-check: verify the UID exists before attempting the move.
+    # IMAP servers silently return OK for non-existent UIDs (RFC 3501), so
+    # without this check a missing UID would appear as a successful move.
+    # A single UID SEARCH is the most reliable approach regardless of whether
+    # UIDPLUS or MOVE are supported (COPYUID is not returned consistently).
+    typ, exists = conn.uid("search", None, f"UID {uid}")
+    if typ != "OK" or not exists[0].strip():
+        return {"error": f"UID {uid} not found in {src}"}
+
+    # RFC 6851 MOVE — atomic, preferred when advertised.
+    if "MOVE" in conn.capabilities:
         typ, _ = conn.uid("MOVE", uid, _q(target_folder))
         if typ == "OK":
             return {"success": True, "uid": uid, "moved_to": target_folder}
-    except imaplib.IMAP4.error:
-        pass  # server does not support MOVE extension
+        return {"error": f"MOVE command failed for UID {uid}"}
 
-    # Fallback: COPY → flag \Deleted → EXPUNGE
+    # Fallback: COPY → \Deleted → EXPUNGE (servers without MOVE capability).
     typ, _ = conn.uid("copy", uid, _q(target_folder))
     if typ != "OK":
         return {"error": f"COPY to '{target_folder}' failed — folder may not exist"}
@@ -473,6 +500,50 @@ def move_mail(
     conn.uid("store", uid, "+FLAGS", "\\Deleted")
     conn.expunge()
     return {"success": True, "uid": uid, "moved_to": target_folder}
+
+
+@mcp.tool()
+def search_emails(
+    criteria: list[str],
+    folder: Optional[str] = None,
+) -> dict:
+    """
+    Search a folder using raw IMAP SEARCH criteria tokens.
+    Returns the UIDs of all matching messages.
+
+    Args:
+        criteria: IMAP SEARCH criteria as a list of string tokens.
+                  Each IMAP keyword or value is a separate list element.
+                  Examples:
+                    ["ALL"]
+                    ["UNSEEN"]
+                    ["FROM", "sender@example.com"]
+                    ["SUBJECT", "invoice"]
+                    ["HEADER", "Message-ID", "<abc123@example.com>"]
+                    ["SINCE", "15-May-2026"]
+                    ["UNSEEN", "FROM", "boss@example.com"]
+        folder:   Folder to search (defaults to IMAP_FOLDER).
+
+    Returns a dict with keys:
+      uids  – list of matching UID strings (pass directly to get_email / move_mail)
+      count – number of matches
+    """
+    if not criteria:
+        return {"error": "criteria must not be empty", "uids": [], "count": 0}
+
+    conn = get_conn()
+    target = folder or IMAP_FOLDER
+
+    typ, _ = conn.select(_q(target), readonly=True)
+    if typ != "OK":
+        return {"error": f"Cannot open folder: {target}", "uids": [], "count": 0}
+
+    typ, data = conn.uid("search", None, *criteria)
+    if typ != "OK" or not data or not data[0]:
+        return {"uids": [], "count": 0}
+
+    uid_list = [u.decode() for u in data[0].split() if u]
+    return {"uids": uid_list, "count": len(uid_list)}
 
 
 @mcp.tool()

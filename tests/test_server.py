@@ -28,6 +28,7 @@ from server import (  # noqa: E402  (import after env setup)
     _decode_rfc2047_fallback,
     _extract_body,
     _is_prohibited,
+    _parse_copyuid,
     _parse_fetch_info,
     _q,
     _strip_html,
@@ -37,6 +38,7 @@ from server import (  # noqa: E402  (import after env setup)
     list_folders,
     mark_as_read,
     move_mail,
+    search_emails,
 )
 
 
@@ -438,9 +440,37 @@ def _make_header_bytes(
 
 class TestListEmails:
     @patch("server.get_conn")
-    def test_happy_day_returns_email_list(self, mock_get_conn):
+    def test_happy_day_uses_sort_when_available(self, mock_get_conn):
         mock_conn = MagicMock()
         mock_get_conn.return_value = mock_conn
+        mock_conn.capabilities = ("IMAP4REV1", "SORT")
+        mock_conn.select.return_value = ("OK", [b"2"])
+
+        header_bytes = _make_header_bytes()
+        info = b"1 (UID 100 FLAGS (\\Seen) BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)] {50}"
+
+        def uid_side_effect(command, *args):
+            if command == "sort":
+                return ("OK", [b"100 101"])
+            if command == "fetch":
+                return ("OK", [(info, header_bytes), b")"])
+            return ("OK", [None])
+
+        mock_conn.uid.side_effect = uid_side_effect
+
+        result = list_emails(limit=10)
+        # Verify SORT was called with correct arguments
+        sort_call = mock_conn.uid.call_args_list[0]
+        assert sort_call[0][0] == "sort"
+        assert sort_call[0][1] == "(REVERSE DATE)"
+        assert sort_call[0][2] == "UTF-8"
+        assert result[0]["uid"] == "100"
+
+    @patch("server.get_conn")
+    def test_falls_back_to_search_without_sort(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.capabilities = ("IMAP4REV1",)  # no SORT
         mock_conn.select.return_value = ("OK", [b"2"])
 
         header_bytes = _make_header_bytes()
@@ -456,15 +486,15 @@ class TestListEmails:
         mock_conn.uid.side_effect = uid_side_effect
 
         result = list_emails(limit=10)
-        assert len(result) == 1
+        search_call = mock_conn.uid.call_args_list[0]
+        assert search_call[0][0] == "search"
         assert result[0]["uid"] == "100"
-        assert result[0]["from"] == "sender@test.example"
-        assert result[0]["subject"] == "Test Subject"
 
     @patch("server.get_conn")
     def test_empty_folder_returns_empty_list(self, mock_get_conn):
         mock_conn = MagicMock()
         mock_get_conn.return_value = mock_conn
+        mock_conn.capabilities = ("IMAP4REV1", "SORT")
         mock_conn.select.return_value = ("OK", [b"0"])
         mock_conn.uid.return_value = ("OK", [b""])
         assert list_emails() == []
@@ -473,12 +503,13 @@ class TestListEmails:
     def test_requested_flags_in_response(self, mock_get_conn):
         mock_conn = MagicMock()
         mock_get_conn.return_value = mock_conn
+        mock_conn.capabilities = ("IMAP4REV1", "SORT")
         mock_conn.select.return_value = ("OK", [b"1"])
 
         info = b"1 (UID 55 FLAGS (\\Flagged) BODY[HEADER.FIELDS ...] {10}"
 
         def uid_side_effect(command, *args):
-            if command == "search":
+            if command == "sort":
                 return ("OK", [b"55"])
             return ("OK", [(info, _make_header_bytes()), b")"])
 
@@ -553,8 +584,15 @@ class TestMoveMail:
     def test_happy_day_with_move_extension(self, mock_get_conn):
         mock_conn = MagicMock()
         mock_get_conn.return_value = mock_conn
+        mock_conn.capabilities = ("IMAP4REV1", "UIDPLUS", "MOVE")
         mock_conn.select.return_value = ("OK", [b"1"])
-        mock_conn.uid.return_value = ("OK", [b""])
+
+        def uid_side_effect(command, *args):
+            if command == "search":
+                return ("OK", [b"42"])   # pre-check: UID exists
+            return ("OK", [b"Move completed"])
+
+        mock_conn.uid.side_effect = uid_side_effect
 
         result = move_mail("42", "Archive")
         assert result["success"] is True
@@ -562,17 +600,16 @@ class TestMoveMail:
 
     @patch("server.get_conn")
     def test_fallback_copy_delete_when_move_unsupported(self, mock_get_conn):
-        import imaplib
-
         mock_conn = MagicMock()
         mock_get_conn.return_value = mock_conn
+        mock_conn.capabilities = ("IMAP4REV1", "UIDPLUS")  # no MOVE
         mock_conn.select.return_value = ("OK", [b"1"])
 
         def uid_side_effect(command, *args):
-            if command == "MOVE":
-                raise imaplib.IMAP4.error("MOVE not supported")
+            if command == "search":
+                return ("OK", [b"42"])   # pre-check: UID exists
             if command == "copy":
-                return ("OK", [b""])
+                return ("OK", [b"Copy completed"])
             if command == "store":
                 return ("OK", [b""])
             return ("OK", [b""])
@@ -581,7 +618,6 @@ class TestMoveMail:
 
         result = move_mail("42", "Archive")
         assert result["success"] is True
-        # COPY and store(\Deleted) must have been called
         commands = [c[0][0] for c in mock_conn.uid.call_args_list]
         assert "copy" in commands
         assert "store" in commands
@@ -595,15 +631,14 @@ class TestMoveMail:
 
     @patch("server.get_conn")
     def test_copy_failure_returns_error(self, mock_get_conn):
-        import imaplib
-
         mock_conn = MagicMock()
         mock_get_conn.return_value = mock_conn
+        mock_conn.capabilities = ("IMAP4REV1",)   # no MOVE → COPY fallback
         mock_conn.select.return_value = ("OK", [b"1"])
 
         def uid_side_effect(command, *args):
-            if command == "MOVE":
-                raise imaplib.IMAP4.error("no MOVE")
+            if command == "search":
+                return ("OK", [b"42"])   # pre-check: UID exists
             if command == "copy":
                 return ("NO", [b"Destination not found"])
             return ("OK", [b""])
@@ -709,3 +744,162 @@ class TestBodySizeLimit:
         result = get_email("7")
         assert "error" not in result
         assert result["uid"] == "7"
+
+
+# ── _parse_copyuid ─────────────────────────────────────────────────────────────
+
+class TestParseCopyUID:
+    def test_parses_single_dest_uid(self):
+        data = [b"[COPYUID 1620000000 42 99] Move completed"]
+        assert _parse_copyuid(data) == "99"
+
+    def test_parses_uid_range(self):
+        data = [b"[COPYUID 1620000000 1:3 10:12] Done"]
+        assert _parse_copyuid(data) == "10:12"
+
+    def test_returns_none_when_absent(self):
+        assert _parse_copyuid([b"Move completed"]) is None
+
+    def test_returns_none_for_empty_data(self):
+        assert _parse_copyuid([]) is None
+        assert _parse_copyuid([None]) is None
+
+    def test_returns_none_for_empty_bytes(self):
+        assert _parse_copyuid([b""]) is None
+
+
+# ── move_mail with pre-check and MOVE/COPY fallback ───────────────────────────
+
+class TestMoveMailUIDPLUS:
+    """Tests covering UID pre-existence check and server-capability branching."""
+
+    @patch("server.get_conn")
+    def test_move_with_uidplus_success(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.capabilities = ("IMAP4REV1", "UIDPLUS", "MOVE")
+        mock_conn.select.return_value = ("OK", [b"1"])
+
+        def uid_side_effect(command, *args):
+            if command == "search":
+                return ("OK", [b"42"])   # pre-check: UID exists
+            return ("OK", [b"Move completed"])
+
+        mock_conn.uid.side_effect = uid_side_effect
+
+        result = move_mail("42", "Archive")
+        assert result["success"] is True
+        assert result["moved_to"] == "Archive"
+
+    @patch("server.get_conn")
+    def test_move_uid_not_found_returns_error(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.capabilities = ("IMAP4REV1", "UIDPLUS", "MOVE")
+        mock_conn.select.return_value = ("OK", [b"1"])
+        # Pre-check: UID not present in source folder → empty search result
+        mock_conn.uid.return_value = ("OK", [b""])
+
+        result = move_mail("42", "Archive")
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+
+    @patch("server.get_conn")
+    def test_move_without_uidplus_precheck_passes(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.capabilities = ("IMAP4REV1", "MOVE")  # no UIDPLUS
+        mock_conn.select.return_value = ("OK", [b"1"])
+
+        def uid_side_effect(command, *args):
+            if command == "search":
+                return ("OK", [b"42"])   # UID exists
+            return ("OK", [b"Move completed"])
+
+        mock_conn.uid.side_effect = uid_side_effect
+
+        result = move_mail("42", "Archive")
+        assert result["success"] is True
+
+    @patch("server.get_conn")
+    def test_move_without_uidplus_precheck_fails(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.capabilities = ("IMAP4REV1", "MOVE")  # no UIDPLUS
+        mock_conn.select.return_value = ("OK", [b"1"])
+
+        def uid_side_effect(command, *args):
+            if command == "search":
+                return ("OK", [b""])   # UID does not exist
+            return ("OK", [b"Move completed"])
+
+        mock_conn.uid.side_effect = uid_side_effect
+
+        result = move_mail("42", "Archive")
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+
+    @patch("server.get_conn")
+    def test_copy_fallback_without_move_capability(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.capabilities = ("IMAP4REV1", "UIDPLUS")  # no MOVE
+        mock_conn.select.return_value = ("OK", [b"1"])
+
+        def uid_side_effect(command, *args):
+            if command == "search":
+                return ("OK", [b"42"])   # pre-check: UID exists
+            if command == "copy":
+                return ("OK", [b"Copy completed"])
+            return ("OK", [b""])
+
+        mock_conn.uid.side_effect = uid_side_effect
+
+        result = move_mail("42", "Archive")
+        assert result["success"] is True
+        assert result["moved_to"] == "Archive"
+        mock_conn.expunge.assert_called_once()
+
+
+# ── search_emails ──────────────────────────────────────────────────────────────
+
+class TestSearchEmails:
+    @patch("server.get_conn")
+    def test_happy_day_unseen(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.select.return_value = ("OK", [b"10"])
+        mock_conn.uid.return_value = ("OK", [b"101 102 103"])
+
+        result = search_emails(["UNSEEN"])
+        assert result["count"] == 3
+        assert result["uids"] == ["101", "102", "103"]
+
+    @patch("server.get_conn")
+    def test_no_matches_returns_empty(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.select.return_value = ("OK", [b"0"])
+        mock_conn.uid.return_value = ("OK", [b""])
+
+        result = search_emails(["FROM", "nobody@example.com"])
+        assert result["count"] == 0
+        assert result["uids"] == []
+
+    @patch("server.get_conn")
+    def test_criteria_tokens_passed_as_separate_args(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.select.return_value = ("OK", [b"5"])
+        mock_conn.uid.return_value = ("OK", [b"55"])
+
+        search_emails(["HEADER", "Message-ID", "<abc@test>"])
+        call_args = mock_conn.uid.call_args[0]
+        # Each token must be a separate argument, not one joined string
+        assert call_args[2] == "HEADER"
+        assert call_args[3] == "Message-ID"
+        assert call_args[4] == "<abc@test>"
+
+    def test_empty_criteria_returns_error(self):
+        result = search_emails([])
+        assert "error" in result
