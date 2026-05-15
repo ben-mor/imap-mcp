@@ -11,6 +11,7 @@ Provides read-only mail access plus folder management (move, mark-as-read).
 | `list_folders` | List all IMAP folders/mailboxes |
 | `list_emails` | List recent emails (sender, subject, date, UID, flags) |
 | `get_email` | Fetch full email body by UID (plain text preferred, HTML stripped) |
+| `search_emails` | Search a folder with raw IMAP SEARCH criteria tokens |
 | `move_mail` | Move a message to a folder (send-related folders are blocked) |
 | `mark_as_read` | Set the `\Seen` flag on a message |
 
@@ -25,6 +26,20 @@ list_emails(limit=30, flags=["\\Seen", "\\Flagged", "\\Answered"])
 ```
 
 Default when omitted: `["\\Seen", "\\Flagged"]`.
+
+### Searching
+
+`search_emails` accepts a list of raw IMAP SEARCH tokens:
+
+```
+search_emails(["UNSEEN"])
+search_emails(["FROM", "boss@example.com"])
+search_emails(["SUBJECT", "invoice", "SINCE", "01-May-2026"])
+search_emails(["FROM", "Hays"], folder="Trash")
+```
+
+Returns `{"uids": [...], "count": N}`.  Pass UIDs directly to `get_email` or
+`move_mail`.
 
 ### Send-folder protection
 
@@ -62,6 +77,8 @@ $EDITOR .env          # fill in IMAP_HOST, IMAP_USER, IMAP_PASSWORD
 | `IMAP_USE_SSL` | `true` | `false` → STARTTLS on port 143 |
 | `IMAP_FOLDER` | `INBOX` | Default folder for all tools |
 | `IMAP_PROHIBITED_FOLDERS` | `Sent,Outbox,Queue` | Blocked move destinations |
+| `IMAP_TIMEOUT` | `30` | Socket timeout in seconds for all IMAP operations |
+| `IMAP_MAX_BODY_BYTES` | `20971520` | Maximum raw message size `get_email` will fetch (20 MB) |
 
 ### 3. Test manually
 
@@ -91,7 +108,7 @@ Edit `~/.config/Claude/claude_desktop_config.json`
 Replace `/absolute/path/to/imap-mcp` with the real path, e.g.
 `/home/yourname/projects/imap-mcp`.
 
-Restart Claude Desktop.  The five IMAP tools should appear in the tool picker.
+Restart Claude Desktop.  The six IMAP tools should appear in the tool picker.
 
 ## Architecture notes
 
@@ -99,13 +116,34 @@ Restart Claude Desktop.  The five IMAP tools should appear in the tool picker.
 - **Connection**: single persistent `IMAP4_SSL` connection, reconnected
   automatically via `NOOP` health-check before each tool call.  Well-suited
   for burst usage (daily sort session) with long idle periods between runs.
+- **Capabilities**: server capabilities are fetched once at connect time and
+  cached for the session.  Used to select the best available code path for
+  sorting (`SORT`) and moving (`MOVE`).
+- **SORT**: `list_emails` uses `UID SORT (REVERSE DATE)` when the server
+  advertises `SORT`; falls back to `UID SEARCH ALL` with reversed UID order.
 - **BODY.PEEK**: `get_email` uses `BODY.PEEK[]` so fetching a message does
   **not** set `\Seen`.  Use `mark_as_read` explicitly.
-- **MOVE**: attempts the RFC 6851 atomic `UID MOVE` command; falls back to
-  `COPY` + `\Deleted` + `EXPUNGE` on servers that do not support it.
+- **Body size limit**: `get_email` pre-checks `RFC822.SIZE` before fetching;
+  messages exceeding `IMAP_MAX_BODY_BYTES` are rejected with an error rather
+  than downloaded.
+- **MOVE**: `move_mail` performs a `UID SEARCH` pre-check to verify the
+  message exists (IMAP servers silently return OK for non-existent UIDs).
+  Then attempts the RFC 6851 atomic `UID MOVE` command; falls back to
+  `COPY` + `\Deleted` + `EXPUNGE` on servers that do not advertise `MOVE`.
 - **HTML stripping**: uses `html.parser` from the stdlib (`convert_charrefs=True`).
-  Further development: replace with `html2text` or `BeautifulSoup` for richer
-  output (preserving links, tables, list structure).
+- **Encoding**: two-layer fallback for malformed headers — `_decode_bytes`
+  catches unknown charset names (e.g. `unknown-8bit`) and falls back to
+  latin-1; `_decode_rfc2047_fallback` handles RFC 2047 encoded words that
+  survive standard decoding with raw 8-bit bytes inside QP payloads.
+
+## Running the tests
+
+```bash
+source .venv/bin/activate
+pytest tests/
+```
+
+All tests are unit tests using `unittest.mock`; no live IMAP connection required.
 
 ## Planned — Version 2
 
