@@ -8,6 +8,7 @@ import email.header
 import imaplib
 import logging
 import os
+import quopri
 import re
 import ssl
 from html.parser import HTMLParser
@@ -29,6 +30,9 @@ IMAP_USER: str = os.environ["IMAP_USER"]
 IMAP_PASSWORD: str = os.environ["IMAP_PASSWORD"]
 IMAP_FOLDER: str = os.getenv("IMAP_FOLDER", "INBOX")
 IMAP_USE_SSL: bool = os.getenv("IMAP_USE_SSL", "true").lower() == "true"
+# Socket timeout in seconds for all IMAP operations.  Prevents indefinite
+# blocking when the server stops responding.  Default: 30 s.
+IMAP_TIMEOUT: float = float(os.getenv("IMAP_TIMEOUT", "30"))
 # Refuse to fetch a message body larger than this (bytes).  Protects against
 # attachment-heavy emails exhausting memory.  Default: 20 MB.
 IMAP_MAX_BODY_BYTES: int = int(os.getenv("IMAP_MAX_BODY_BYTES", str(20 * 1024 * 1024)))
@@ -61,9 +65,9 @@ def get_conn() -> imaplib.IMAP4:
     ssl_ctx = ssl.create_default_context()
 
     if IMAP_USE_SSL:
-        conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ssl_ctx)
+        conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ssl_ctx, timeout=IMAP_TIMEOUT)
     else:
-        conn = imaplib.IMAP4(IMAP_HOST, IMAP_PORT)
+        conn = imaplib.IMAP4(IMAP_HOST, IMAP_PORT, timeout=IMAP_TIMEOUT)
         conn.starttls(ssl_context=ssl_ctx)
 
     conn.login(IMAP_USER, IMAP_PASSWORD)
@@ -90,16 +94,60 @@ _LIST_LINE = re.compile(
 )
 
 
+# Matches a single RFC2047 encoded word: =?charset?Q|B?encoded_text?=
+_RFC2047_WORD = re.compile(r"=\?([^?]+)\?([BbQq])\?([^?]*)\?=")
+
+
+def _decode_rfc2047_fallback(value: str) -> str:
+    """Fallback for malformed QP encoded words that email.header.decode_header()
+    returns undecoded (e.g. raw 8-bit chars inside a QP token instead of =XX).
+
+    Only handles Q (quoted-printable) encoding — if a B (base64) encoded word
+    failed the standard decoder it is genuinely broken and returned unchanged.
+    No charset guessing: uses the declared charset via _decode_bytes.
+    """
+    def _decode_word(m: re.Match) -> str:
+        charset, transfer_enc, encoded_text = m.group(1), m.group(2).upper(), m.group(3)
+        if transfer_enc != "Q":
+            return m.group(0)  # leave base64 words unchanged
+        try:
+            raw_bytes = encoded_text.encode("latin-1", errors="replace")
+            decoded = quopri.decodestring(raw_bytes.replace(b"_", b" "))
+            return _decode_bytes(decoded, charset)
+        except Exception:
+            return m.group(0)  # return unchanged rather than crash
+
+    return _RFC2047_WORD.sub(_decode_word, value)
+
+
+def _decode_bytes(data: bytes, charset: Optional[str]) -> str:
+    """Decode bytes using *charset*, with two fallback layers.
+
+    errors='replace' handles bad byte sequences within a known codec.
+    The LookupError catch handles completely unknown charset names such as
+    'unknown-8bit', 'x-unknown', etc.  latin-1 is the safest fallback
+    because it maps all 256 byte values 1-to-1 to Unicode and never raises.
+    """
+    enc = charset or "utf-8"
+    try:
+        return data.decode(enc, errors="replace")
+    except LookupError:
+        return data.decode("latin-1", errors="replace")
+
+
 def _decode_header(value: Optional[str]) -> str:
     if not value:
         return ""
     parts = email.header.decode_header(value)
     chunks: list[str] = []
     for chunk, charset in parts:
-        if isinstance(chunk, bytes):
-            chunks.append(chunk.decode(charset or "utf-8", errors="replace"))
-        else:
-            chunks.append(str(chunk))
+        text = _decode_bytes(chunk, charset) if isinstance(chunk, bytes) else str(chunk)
+        # Run the fallback if the result still contains an encoded word —
+        # this happens whether decode_header returned bytes (unknown-8bit
+        # wrapping) or a plain str (RFC2047 parse failure).
+        if "=?" in text and "?=" in text:
+            text = _decode_rfc2047_fallback(text)
+        chunks.append(text)
     return "".join(chunks)
 
 
@@ -158,12 +206,12 @@ def _extract_body(msg: email.message.Message) -> dict:
         raw_payload = part.get_payload(decode=True)
         if raw_payload is None:
             continue
-        charset = part.get_content_charset() or "utf-8"
+        charset = part.get_content_charset()
 
         if ct == "text/plain" and plain is None:
-            plain = raw_payload.decode(charset, errors="replace")
+            plain = _decode_bytes(raw_payload, charset)
         elif ct == "text/html" and html_body is None:
-            html_body = raw_payload.decode(charset, errors="replace")
+            html_body = _decode_bytes(raw_payload, charset)
 
     if plain is not None:
         return {"body": plain, "html_stripped": False, "attachments": attachments}

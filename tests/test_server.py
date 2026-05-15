@@ -23,7 +23,9 @@ os.environ.setdefault("IMAP_PROHIBITED_FOLDERS", "Sent,Outbox,Queue")
 
 from server import (  # noqa: E402  (import after env setup)
     _LIST_LINE,
+    _decode_bytes,
     _decode_header,
+    _decode_rfc2047_fallback,
     _extract_body,
     _is_prohibited,
     _parse_fetch_info,
@@ -39,6 +41,96 @@ from server import (  # noqa: E402  (import after env setup)
 
 
 # ── _decode_header ─────────────────────────────────────────────────────────────
+
+class TestDecodeRFC2047Fallback:
+    def test_qp_with_raw_latin1_chars(self):
+        # Simulates a malformed header: ä (0xE4) and ü (0xFC) placed raw inside
+        # a QP encoded word instead of being escaped as =E4 / =FC.
+        # email.header.decode_header() passes this through as a plain str;
+        # our fallback should strip the wrapper and return readable text.
+        raw = "=?iso-8859-1?Q?Erg=E4nzung_f=FCr?="  # well-formed — baseline
+        assert "Ergänzung" in _decode_rfc2047_fallback(raw)
+        assert "für" in _decode_rfc2047_fallback(raw)
+
+    def test_qp_underscore_becomes_space(self):
+        result = _decode_rfc2047_fallback("=?utf-8?Q?hello_world?=")
+        assert result == "hello world"
+
+    def test_base64_encoded_word_returned_unchanged(self):
+        # B-encoded words are left alone — if decode_header couldn't handle
+        # them they are genuinely broken and we don't try to be clever.
+        import base64 as _b64
+        encoded = _b64.b64encode("Héllo".encode("utf-8")).decode()
+        raw = f"=?utf-8?B?{encoded}?="
+        assert _decode_rfc2047_fallback(raw) == raw
+
+    def test_unparseable_word_returned_unchanged(self):
+        # Totally broken encoded word — should come back as-is, not raise
+        raw = "=?bogus?X?garbage?="
+        result = _decode_rfc2047_fallback(raw)
+        assert isinstance(result, str)
+
+    def test_plain_text_passthrough(self):
+        assert _decode_rfc2047_fallback("no encoding here") == "no encoding here"
+
+    def test_mixed_encoded_and_plain(self):
+        result = _decode_rfc2047_fallback("Hello =?utf-8?Q?W=C3=B6rld?= !")
+        assert "Wörld" in result
+        assert "Hello" in result
+
+    def test_decode_header_calls_fallback_for_raw_encoded_word(self):
+        # This is the real-world subject line that triggered the bug.
+        # The encoded word contains ä and ü as raw latin-1 bytes, making it
+        # malformed QP — email.header.decode_header() returns it as a plain str.
+        subject = "=?iso-8859-1?Q?Die_smarte_Erg\xe4nzung_f\xfcr_Sie?="
+        result = _decode_header(subject)
+        assert "Ergänzung" in result
+        assert "für" in result
+        # The RFC2047 wrapper must be gone
+        assert "=?" not in result
+
+    def test_decode_header_via_message_from_bytes(self):
+        # Regression test for the exact failure path seen in production:
+        # email.message_from_bytes() wraps non-ASCII header bytes in a Header
+        # object with charset 'unknown-8bit', so decode_header() returns the
+        # encoded word as *bytes* (not str) — the fallback must still fire.
+        raw = (
+            b"Subject: =?iso-8859-1?Q?Re:_Re: Die smarte Erg\xe4nzung"
+            b" f\xfcr Ihre Abnehmziele .?=\r\n\r\n"
+        )
+        msg = email.message_from_bytes(raw)
+        result = _decode_header(msg.get("Subject"))
+        assert "Ergänzung" in result
+        assert "für" in result
+        assert "=?" not in result
+
+
+class TestDecodeBytes:
+    def test_known_charset_utf8(self):
+        assert _decode_bytes("héllo".encode("utf-8"), "utf-8") == "héllo"
+
+    def test_known_charset_latin1(self):
+        assert _decode_bytes("caf\xe9".encode("latin-1"), "latin-1") == "café"
+
+    def test_none_charset_defaults_to_utf8(self):
+        assert _decode_bytes(b"hello", None) == "hello"
+
+    def test_unknown_charset_falls_back_to_latin1(self):
+        # "unknown-8bit" is a real non-standard charset some MTAs emit;
+        # Python has no codec for it so we must not raise LookupError.
+        result = _decode_bytes(b"caf\xe9", "unknown-8bit")
+        assert result == "café"   # latin-1 decode of \xe9
+
+    def test_other_unknown_charset_names(self):
+        for bogus in ("x-unknown", "unknown", "ansi"):
+            result = _decode_bytes(b"test", bogus)
+            assert result == "test"   # ASCII bytes survive any fallback
+
+    def test_bad_bytes_replaced_not_raised(self):
+        # Invalid UTF-8 sequence — errors='replace' must swallow it
+        result = _decode_bytes(b"\xff\xfe", "utf-8")
+        assert isinstance(result, str)
+
 
 class TestDecodeHeader:
     def test_plain_ascii(self):
