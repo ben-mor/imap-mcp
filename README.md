@@ -147,6 +147,24 @@ All tests are unit tests using `unittest.mock`; no live IMAP connection required
 
 ## Planned — Version 2
 
-- Multi-mailbox support: multiple `[imap-*]` sections in `.env`, each with its
-  own credentials, exposed as separate MCP servers or via a folder-prefix
-  namespace.
+- Multi-mailbox support: TOML config with one section per account, shared
+  rules store (folder descriptions, handling rules) readable by all sessions,
+  cross-mailbox move via FETCH + APPEND + DELETE.
+
+## Backlog
+
+- **Bulk move**: accept a list of UIDs in a single `move_mail` call instead of
+  one call per message.
+
+- **Stable message identity after move**: `move_mail` should return the new UID
+  the message received in the destination folder, so callers can continue
+  referencing it.  Alternative: investigate `X-GM-MSGID` (Gmail) or
+  `Message-ID` header as a server-independent stable identifier.
+
+- **Arbitrary header search**: `search_emails` should support searching by any
+  header field via the IMAP `HEADER` criterion, not just the fields currently
+  indexed (From, Subject, etc.).
+
+- **Configurable returned headers**: `list_emails` and `search_emails` should
+  accept a parameter specifying which headers to include in the response, rather
+  than returning a fixed set.
