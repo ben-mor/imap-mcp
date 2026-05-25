@@ -1,6 +1,4 @@
-# Credentials and local config — never commit
-.env
-mailboxes.toml
+# Local config and credentials — never commit
 .config/
 *.db
 

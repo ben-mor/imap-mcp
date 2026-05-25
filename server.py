@@ -22,14 +22,6 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
 
-try:
-    import tomllib          # Python 3.11+
-except ImportError:
-    try:
-        import tomli as tomllib   # type: ignore[no-redef]
-    except ImportError:
-        tomllib = None            # type: ignore[assignment]
-
 from mcp.server.fastmcp import FastMCP
 
 logging.basicConfig(level=logging.WARNING)
@@ -39,47 +31,35 @@ mcp = FastMCP("imap-mcp")
 
 # ── Config loading ─────────────────────────────────────────────────────────────
 
-_ROOT            = Path(__file__).parent
-_MAILBOXES_TOML  = _ROOT / "mailboxes.toml"
-_DB_PATH         = _ROOT / ".config" / "imap-mcp.db"
+_ROOT    = Path(__file__).parent
+_DB_PATH = _ROOT / ".config" / "imap-mcp.db"
 
 # mailbox_name → connection-config dict
 _mailbox_configs: dict[str, dict] = {}
 
 
 def _load_configs() -> None:
-    """Populate _mailbox_configs from mailboxes.toml + per-account connection.json.
+    """Discover mailboxes by globbing .config/*/connection.json.
 
-    Silently leaves _mailbox_configs empty when mailboxes.toml is absent so
-    that the module can be imported without a real config (e.g. in tests that
-    inject configs directly into _mailbox_configs).
+    Each subdirectory of .config/ that contains a connection.json becomes a
+    mailbox; the directory name is the mailbox identifier.  Silently leaves
+    _mailbox_configs empty when .config/ is absent so the module can be
+    imported without real config (e.g. in tests that inject configs directly).
     """
     global _mailbox_configs
 
-    if not _MAILBOXES_TOML.exists():
-        logger.warning("mailboxes.toml not found at %s — no mailboxes configured", _MAILBOXES_TOML)
+    config_base = _ROOT / ".config"
+    if not config_base.exists():
+        logger.warning(".config/ not found — no mailboxes configured")
         return
 
-    if tomllib is None:
-        raise RuntimeError(
-            "tomllib / tomli is required to parse mailboxes.toml. "
-            "Install tomli on Python < 3.11:  pip install tomli"
-        )
-
-    with open(_MAILBOXES_TOML, "rb") as fh:
-        toml_data = tomllib.load(fh)
-
     configs: dict[str, dict] = {}
-    for name, entry in toml_data.get("mailbox", {}).items():
-        config_dir = _ROOT / entry["config_dir"]
-        conn_file  = config_dir / "connection.json"
-        if not conn_file.exists():
-            logger.error("connection.json missing for mailbox %r at %s", name, conn_file)
-            continue
+    for conn_file in sorted(config_base.glob("*/connection.json")):
+        name = conn_file.parent.name
         with open(conn_file) as fh:
             cfg = json.load(fh)
         configs[name] = cfg
-        logger.info("Loaded mailbox config: %r (%s)", name, cfg.get("host", "?"))
+        logger.info("Loaded mailbox: %r (%s)", name, cfg.get("host", "?"))
 
     _mailbox_configs = configs
 

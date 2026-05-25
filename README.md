@@ -63,26 +63,19 @@ pip install -r requirements.txt
 
 ### 2. Configure mailboxes
 
-```bash
-cp mailboxes.toml.example mailboxes.toml
-```
-
-Edit `mailboxes.toml` to list your accounts:
-
-```toml
-[mailbox.personal]
-config_dir = ".config/personal"
-
-[mailbox.work]
-config_dir = ".config/work"
-```
-
-For each account create a `connection.json` (use the example as a template):
+Accounts are discovered automatically from `.config/`.  Create one
+subdirectory per account — the directory name becomes the mailbox identifier
+used in every tool call.
 
 ```bash
 mkdir -p .config/personal
 cp .config/example/connection.json .config/personal/connection.json
 $EDITOR .config/personal/connection.json
+
+# Repeat for additional accounts:
+mkdir -p .config/work
+cp .config/example/connection.json .config/work/connection.json
+$EDITOR .config/work/connection.json
 ```
 
 `connection.json` fields:
@@ -175,7 +168,6 @@ All tests are unit tests using `unittest.mock`; no live IMAP connection required
 
 ```
 imap-mcp/
-  mailboxes.toml          ← explicit mailbox list + paths; safe to commit, no secrets
   .config/
     personal/
       connection.json     ← credentials only; git-ignored, chmod 600
@@ -183,6 +175,9 @@ imap-mcp/
       connection.json
     imap-mcp.db           ← single SQLite for all mailboxes; git-ignored
 ```
+
+Mailboxes are discovered automatically by globbing `.config/*/connection.json`.
+The directory name is the mailbox identifier.  No separate registry file needed.
 
 **SQLite schema**
 
