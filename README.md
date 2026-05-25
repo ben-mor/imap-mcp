@@ -61,24 +61,46 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure
+### 2. Configure mailboxes
 
 ```bash
-cp .env.example .env
-$EDITOR .env          # fill in IMAP_HOST, IMAP_USER, IMAP_PASSWORD
+cp mailboxes.toml.example mailboxes.toml
 ```
 
-| Variable | Default | Description |
+Edit `mailboxes.toml` to list your accounts:
+
+```toml
+[mailbox.personal]
+config_dir = ".config/personal"
+
+[mailbox.work]
+config_dir = ".config/work"
+```
+
+For each account create a `connection.json` (use the example as a template):
+
+```bash
+mkdir -p .config/personal
+cp .config/example/connection.json .config/personal/connection.json
+$EDITOR .config/personal/connection.json
+```
+
+`connection.json` fields:
+
+| Field | Default | Description |
 |---|---|---|
-| `IMAP_HOST` | — | IMAP server hostname (required) |
-| `IMAP_PORT` | `993` | Port — 993 for implicit TLS, 143 for STARTTLS |
-| `IMAP_USER` | — | Login username / email address (required) |
-| `IMAP_PASSWORD` | — | Login password (required) |
-| `IMAP_USE_SSL` | `true` | `false` → STARTTLS on port 143 |
-| `IMAP_FOLDER` | `INBOX` | Default folder for all tools |
-| `IMAP_PROHIBITED_FOLDERS` | `Sent,Outbox,Queue` | Blocked move destinations |
-| `IMAP_TIMEOUT` | `30` | Socket timeout in seconds for all IMAP operations |
-| `IMAP_MAX_BODY_BYTES` | `20971520` | Maximum raw message size `get_email` will fetch (20 MB) |
+| `host` | — | IMAP server hostname (required) |
+| `port` | `993` | Port — 993 for implicit TLS, 143 for STARTTLS |
+| `user` | — | Login username / email address (required) |
+| `password` | — | Login password (required) |
+| `use_ssl` | `true` | `false` → STARTTLS on port 143 |
+| `folder` | `INBOX` | Default folder for all tools |
+| `prohibited_folders` | `["Sent","Outbox","Queue"]` | Blocked move destinations |
+| `timeout` | `30` | Socket timeout in seconds |
+| `max_body_bytes` | `20971520` | Maximum message size `get_email` will fetch (20 MB) |
+
+Both `mailboxes.toml` and `.config/` are git-ignored — credentials never
+leave the local machine.
 
 ### 3. Test manually
 
@@ -108,7 +130,7 @@ Edit `~/.config/Claude/claude_desktop_config.json`
 Replace `/absolute/path/to/imap-mcp` with the real path, e.g.
 `/home/yourname/projects/imap-mcp`.
 
-Restart Claude Desktop.  The six IMAP tools should appear in the tool picker.
+Restart Claude Desktop.  The full tool set should appear in the tool picker.
 
 ## Architecture notes
 
@@ -147,9 +169,93 @@ All tests are unit tests using `unittest.mock`; no live IMAP connection required
 
 ## Planned — Version 2
 
-- Multi-mailbox support: TOML config with one section per account, shared
-  rules store (folder descriptions, handling rules) readable by all sessions,
-  cross-mailbox move via FETCH + APPEND + DELETE.
+### Multi-mailbox architecture
+
+**File layout**
+
+```
+imap-mcp/
+  mailboxes.toml          ← explicit mailbox list + paths; safe to commit, no secrets
+  .config/
+    personal/
+      connection.json     ← credentials only; git-ignored, chmod 600
+    work/
+      connection.json
+    imap-mcp.db           ← single SQLite for all mailboxes; git-ignored
+```
+
+**SQLite schema**
+
+Two tables; the audit table is append-only — no `UPDATE` or `DELETE` is ever
+issued against it.
+
+```sql
+CREATE TABLE rules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    mailbox     TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    rule        TEXT    NOT NULL,   -- markdown, arbitrarily long
+    rule_order  INTEGER NOT NULL DEFAULT 100,   -- non-unique sort key
+    created_at  TEXT    NOT NULL,
+    updated_at  TEXT    NOT NULL,
+    deleted_at  TEXT                -- soft-delete; NULL = active
+);
+
+CREATE TABLE audit (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT    NOT NULL,   -- ISO-8601
+    mailbox     TEXT    NOT NULL,
+    rule_id     INTEGER NOT NULL,
+    action      TEXT    NOT NULL,   -- 'add' | 'change' | 'remove'
+    caller      TEXT    NOT NULL,   -- e.g. "claude-desktop · Sonnet 4.6"
+    reason      TEXT    NOT NULL,
+    old_value   TEXT,               -- JSON snapshot of previous row; NULL for add
+    new_value   TEXT                -- JSON snapshot of new row; NULL for remove
+);
+```
+
+`remove_rule` performs a soft-delete (`deleted_at = NOW()`).  The audit row
+preserves the final state of the rule so the history is complete.
+`get_rules` returns only active rows (`WHERE deleted_at IS NULL`), ordered by
+`rule_order ASC`.
+
+**Concurrency**
+
+Each Claude Desktop session is its own OS process (stdio transport).  SQLite in
+WAL mode handles concurrent readers and serialises the rare rule writes without
+application-level locking.  `connection.json` is read-only at runtime — no
+locking needed.
+
+**Tool API**
+
+`mailbox` is required on every tool; there is no default.
+
+```
+# Mailboxes
+list_mailboxes()
+
+# Mail tools (all require mailbox)
+list_folders(mailbox)
+list_emails(mailbox, folder, limit, flags)
+get_email(mailbox, uid, folder)
+search_emails(mailbox, criteria, folder)
+mark_as_read(mailbox, uid, folder)
+move_mail(mailbox, uid, target_folder, source_folder)
+move_mail_cross(src_mailbox, uid, src_folder, dst_mailbox, dst_folder)
+
+# Rules tools (caller + reason required on every write)
+get_rules(mailbox)
+add_rule(mailbox, name, rule, caller, reason, rule_order=100)
+    → {"id": <auto-generated integer>}
+change_rule(mailbox, id, caller, reason, name=None, rule=None, rule_order=None)
+remove_rule(mailbox, id, caller, reason)
+```
+
+**Cross-mailbox move** (`move_mail_cross`): `UID FETCH RFC822` on source →
+`APPEND` on destination → `UID STORE \Deleted` + `EXPUNGE` on source.
+Failure modes: fetch-ok / append-fail → original untouched; append-ok /
+delete-fail → message duplicated, error returned with new UID so caller can
+clean up.
 
 ## Backlog
 

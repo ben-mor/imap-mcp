@@ -1,5 +1,8 @@
-# Credentials — never commit
+# Credentials and local config — never commit
 .env
+mailboxes.toml
+.config/
+*.db
 
 # Python
 __pycache__/
