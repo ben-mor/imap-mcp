@@ -17,6 +17,7 @@ import quopri
 import re
 import sqlite3
 import ssl
+import traceback
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -157,6 +158,11 @@ def get_conn(mailbox: str) -> imaplib.IMAP4:
         new_conn = imaplib.IMAP4(host, port, timeout=timeout)
         new_conn.starttls(ssl_context=ssl_ctx)
 
+    # imaplib encodes all string arguments (including the password) via
+    # self._encoding, which defaults to 'ascii'.  Passwords that contain
+    # non-ASCII characters (e.g. § \xa7, ä, ©) would raise UnicodeEncodeError.
+    # UTF-8 is a strict superset of ASCII so this is safe for all accounts.
+    new_conn._encoding = "utf-8"
     new_conn.login(cfg["user"], cfg["password"])
     _connections[mailbox] = new_conn
     logger.info("IMAP connected: %s → %s:%s", mailbox, host, port)
@@ -456,6 +462,21 @@ def list_emails(
     if err:
         return [{"error": err}]
 
+    try:
+        return _list_emails_inner(mailbox, limit, folder, flags)
+    except Exception:
+        tb = traceback.format_exc()
+        logger.error("list_emails crashed:\n%s", tb)
+        return [{"error": "list_emails raised an exception", "traceback": tb}]
+
+
+def _list_emails_inner(
+    mailbox: str,
+    limit:   int,
+    folder:  Optional[str],
+    flags:   Optional[list[str]],
+) -> list[dict]:
+    """Inner implementation — called by list_emails which wraps it in try/except."""
     limit  = min(limit, 200)
     conn   = get_conn(mailbox)
     target = folder or _default_folder(mailbox)
@@ -464,21 +485,29 @@ def list_emails(
     if typ != "OK":
         return [{"error": f"Cannot open folder: {target}"}]
 
-    if "SORT" in conn.capabilities:
+    capabilities_repr = repr(conn.capabilities)
+
+    if "SORT" in conn.capabilities or b"SORT" in conn.capabilities:
         typ, data = conn.uid("sort", "(REVERSE DATE)", "UTF-8", "ALL")
         if typ != "OK" or not data or not data[0]:
             return []
-        uid_list = data[0].split()[:limit]
+        raw_tokens = data[0].split() if isinstance(data[0], bytes) else [
+            t.encode("latin-1", errors="replace") for t in data[0].split()
+        ]
+        uid_list = [u for u in raw_tokens if u.isdigit()][:limit]
     else:
         typ, data = conn.uid("search", None, "ALL")
         if typ != "OK" or not data or not data[0]:
             return []
-        uid_list = data[0].split()[-limit:][::-1]
+        raw_tokens = data[0].split() if isinstance(data[0], bytes) else [
+            t.encode("latin-1", errors="replace") for t in data[0].split()
+        ]
+        uid_list = [u for u in raw_tokens if u.isdigit()][-limit:][::-1]
 
     if not uid_list:
         return []
 
-    uid_str    = ",".join(u.decode() for u in uid_list)
+    uid_str    = ",".join(u.decode("ascii") for u in uid_list)
     fetch_spec = "(UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])"
     typ, fetch_data = conn.uid("fetch", uid_str, fetch_spec)
     if typ != "OK":
@@ -615,7 +644,7 @@ def search_emails(
     if typ != "OK" or not data or not data[0]:
         return {"uids": [], "count": 0}
 
-    uid_list = [u.decode() for u in data[0].split() if u]
+    uid_list = [u.decode("ascii") for u in data[0].split() if u.isdigit()]
     return {"uids": uid_list, "count": len(uid_list)}
 
 
