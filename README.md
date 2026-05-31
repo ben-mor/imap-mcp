@@ -254,8 +254,40 @@ clean up.
 
 ## Backlog
 
-- **Bulk move**: accept a list of UIDs in a single `move_mail` call instead of
-  one call per message.
+- **Attachment download** (`get_attachment` tool): `get_email` already returns
+  attachment metadata (filename, content\_type, size\_bytes) but no content.
+  A new tool is preferred over extending `get_email` so agents can fetch
+  individual attachments lazily without pulling everything:
+
+  ```
+  get_attachment(mailbox, uid, filename, folder=None)
+  → { filename, content_type, size_bytes, content_base64 }
+  ```
+
+  Useful for binary formats that agents need to process directly: DMARC XML.gz,
+  PDFs, ICS calendar files, etc.
+
+- **Bulk same-mailbox move** (`move_mail_bulk`): accept a list of UIDs in a
+  single call instead of one call per message.  Partial failures should be
+  reported per-UID rather than aborting the whole batch:
+
+  ```
+  move_mail_bulk(mailbox, uids: list[str], target_folder, source_folder=None)
+  → { moved: [{ uid }], failed: [{ uid, error }] }
+  ```
+
+- **Bulk cross-mailbox move** (`move_mail_cross_bulk`): the same bulk pattern
+  for `move_mail_cross`.  25 mails currently require 25 sequential tool calls;
+  a single batched call reduces both latency and context consumption:
+
+  ```
+  move_mail_cross_bulk(src_mailbox, uids: list[str], src_folder,
+                       dst_mailbox, dst_folder)
+  → { moved: [{ src_uid, new_uid }], failed: [{ src_uid, error }] }
+  ```
+
+  Implementation can remain sequential internally — the benefit is on the
+  agent side (one tool call instead of N).
 
 - **Stable message identity after move**: `move_mail` should return the new UID
   the message received in the destination folder, so callers can continue
