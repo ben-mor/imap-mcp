@@ -21,6 +21,7 @@ import pytest
 
 from server import (  # noqa: E402
     _LIST_LINE,
+    _bulk_summary,
     _decode_bytes,
     _decode_header,
     _decode_rfc2047_fallback,
@@ -585,143 +586,6 @@ class TestMarkAsRead:
         assert select_call[0] == ('"Archive"',)
 
 
-# ── Tool: move_mail ────────────────────────────────────────────────────────────
-
-class TestMoveMail:
-    @patch("server.get_conn")
-    def test_happy_day_with_move_extension(self, mock_get_conn):
-        mock_conn = MagicMock()
-        mock_get_conn.return_value = mock_conn
-        mock_conn.capabilities = ("IMAP4REV1", "UIDPLUS", "MOVE")
-        mock_conn.select.return_value = ("OK", [b"1"])
-
-        def uid_side_effect(command, *args):
-            if command == "search": return ("OK", [b"42"])
-            return ("OK", [b"Move completed"])
-
-        mock_conn.uid.side_effect = uid_side_effect
-        result = move_mail("test", "42", "Archive")
-        assert result["success"] is True and result["moved_to"] == "Archive"
-
-    @patch("server.get_conn")
-    def test_fallback_copy_delete_when_move_unsupported(self, mock_get_conn):
-        mock_conn = MagicMock()
-        mock_get_conn.return_value = mock_conn
-        mock_conn.capabilities = ("IMAP4REV1", "UIDPLUS")
-        mock_conn.select.return_value = ("OK", [b"1"])
-
-        def uid_side_effect(command, *args):
-            if command == "search": return ("OK", [b"42"])
-            if command == "copy":   return ("OK", [b"Copy completed"])
-            return ("OK", [b""])
-
-        mock_conn.uid.side_effect = uid_side_effect
-        result = move_mail("test", "42", "Archive")
-        assert result["success"] is True
-        commands = [c[0][0] for c in mock_conn.uid.call_args_list]
-        assert "copy" in commands and "store" in commands
-        mock_conn.expunge.assert_called_once()
-
-    @pytest.mark.parametrize("bad_folder", ["Sent", "Outbox", "Queue", "My Sent Items"])
-    def test_prohibited_folder_rejected(self, bad_folder):
-        result = move_mail("test", "1", bad_folder)
-        assert "error" in result
-        assert "prohibited" in result["error"].lower() or "Blocked" in result["error"]
-
-    @patch("server.get_conn")
-    def test_copy_failure_returns_error(self, mock_get_conn):
-        mock_conn = MagicMock()
-        mock_get_conn.return_value = mock_conn
-        mock_conn.capabilities = ("IMAP4REV1",)   # no MOVE → COPY fallback
-        mock_conn.select.return_value = ("OK", [b"1"])
-
-        def uid_side_effect(command, *args):
-            if command == "search": return ("OK", [b"42"])
-            if command == "copy":   return ("NO", [b"Destination not found"])
-            return ("OK", [b""])
-
-        mock_conn.uid.side_effect = uid_side_effect
-        assert "error" in move_mail("test", "42", "NonExistentFolder")
-
-    def test_unknown_mailbox_returns_error(self):
-        assert "error" in move_mail("no_such_mailbox", "1", "Archive")
-
-
-# ── Tool: move_mail — UIDPLUS / pre-check variants ────────────────────────────
-
-class TestMoveMailUIDPLUS:
-    @patch("server.get_conn")
-    def test_move_with_uidplus_success(self, mock_get_conn):
-        mock_conn = MagicMock()
-        mock_get_conn.return_value = mock_conn
-        mock_conn.capabilities = ("IMAP4REV1", "UIDPLUS", "MOVE")
-        mock_conn.select.return_value = ("OK", [b"1"])
-
-        def uid_side_effect(command, *args):
-            if command == "search": return ("OK", [b"42"])
-            return ("OK", [b"Move completed"])
-
-        mock_conn.uid.side_effect = uid_side_effect
-        result = move_mail("test", "42", "Archive")
-        assert result["success"] is True and result["moved_to"] == "Archive"
-
-    @patch("server.get_conn")
-    def test_move_uid_not_found_returns_error(self, mock_get_conn):
-        mock_conn = MagicMock()
-        mock_get_conn.return_value = mock_conn
-        mock_conn.capabilities = ("IMAP4REV1", "UIDPLUS", "MOVE")
-        mock_conn.select.return_value = ("OK", [b"1"])
-        mock_conn.uid.return_value = ("OK", [b""])   # empty search → not found
-        result = move_mail("test", "42", "Archive")
-        assert "error" in result and "not found" in result["error"].lower()
-
-    @patch("server.get_conn")
-    def test_move_without_uidplus_precheck_passes(self, mock_get_conn):
-        mock_conn = MagicMock()
-        mock_get_conn.return_value = mock_conn
-        mock_conn.capabilities = ("IMAP4REV1", "MOVE")
-        mock_conn.select.return_value = ("OK", [b"1"])
-
-        def uid_side_effect(command, *args):
-            if command == "search": return ("OK", [b"42"])
-            return ("OK", [b"Move completed"])
-
-        mock_conn.uid.side_effect = uid_side_effect
-        assert move_mail("test", "42", "Archive")["success"] is True
-
-    @patch("server.get_conn")
-    def test_move_without_uidplus_precheck_fails(self, mock_get_conn):
-        mock_conn = MagicMock()
-        mock_get_conn.return_value = mock_conn
-        mock_conn.capabilities = ("IMAP4REV1", "MOVE")
-        mock_conn.select.return_value = ("OK", [b"1"])
-
-        def uid_side_effect(command, *args):
-            if command == "search": return ("OK", [b""])
-            return ("OK", [b"Move completed"])
-
-        mock_conn.uid.side_effect = uid_side_effect
-        result = move_mail("test", "42", "Archive")
-        assert "error" in result and "not found" in result["error"].lower()
-
-    @patch("server.get_conn")
-    def test_copy_fallback_without_move_capability(self, mock_get_conn):
-        mock_conn = MagicMock()
-        mock_get_conn.return_value = mock_conn
-        mock_conn.capabilities = ("IMAP4REV1", "UIDPLUS")
-        mock_conn.select.return_value = ("OK", [b"1"])
-
-        def uid_side_effect(command, *args):
-            if command == "search": return ("OK", [b"42"])
-            if command == "copy":   return ("OK", [b"Copy completed"])
-            return ("OK", [b""])
-
-        mock_conn.uid.side_effect = uid_side_effect
-        result = move_mail("test", "42", "Archive")
-        assert result["success"] is True and result["moved_to"] == "Archive"
-        mock_conn.expunge.assert_called_once()
-
-
 # ── Tool: move_mail_cross ──────────────────────────────────────────────────────
 
 class TestMoveMailCross:
@@ -826,9 +690,10 @@ class TestValidUID:
         result = get_email("test", "abc123")
         assert "error" in result and "Invalid UID" in result["error"]
 
-    def test_move_mail_rejects_bad_uid(self):
-        result = move_mail("test", "not-a-uid", "Archive")
-        assert "error" in result and "Invalid UID" in result["error"]
+    def test_move_mail_marks_bad_uid_as_invalid(self):
+        result = move_mail("test", ["not-a-uid"], "Archive")
+        assert result["summary"]["invalid"] == 1
+        assert result["results"][0]["status"] == "invalid"
 
     def test_mark_as_read_rejects_bad_uid(self):
         result = mark_as_read("test", "12;DROP")
@@ -988,3 +853,282 @@ class TestRules:
         remove_rule("test", rule_id, "c", "r3")
         count = _fresh_db.execute("SELECT COUNT(*) FROM audit").fetchone()[0]
         assert count == 3   # add + change + remove
+
+
+# ── Helper: _bulk_summary ─────────────────────────────────────────────────────
+
+class TestBulkSummary:
+    def test_counts_statuses(self):
+        results = [
+            {"uid": "1", "status": "moved"},
+            {"uid": "2", "status": "moved"},
+            {"uid": "3", "status": "not_found"},
+            {"uid": "4", "status": "invalid"},
+        ]
+        s = _bulk_summary(results)
+        assert s["total"]     == 4
+        assert s["moved"]     == 2
+        assert s["not_found"] == 1
+        assert s["invalid"]   == 1
+
+    def test_empty_list(self):
+        s = _bulk_summary([])
+        assert s == {"total": 0}
+
+    def test_single_status(self):
+        s = _bulk_summary([{"uid": "1", "status": "moved"}])
+        assert s == {"total": 1, "moved": 1}
+
+
+# ── Tool: move_mail ───────────────────────────────────────────────────────────
+
+def _make_bulk_conn(capabilities, uid_responses, expunge_response=("OK", [b""])):
+    """Return a MagicMock IMAP connection wired for move_mail tests.
+
+    uid_responses is consumed in call order via an iterator.
+    """
+    mock_conn = MagicMock()
+    mock_conn.capabilities = capabilities
+    mock_conn.select.return_value = ("OK", [b"3"])
+    mock_conn.expunge.return_value = expunge_response
+    responses = iter(uid_responses)
+    mock_conn.uid.side_effect = lambda *a, **kw: next(responses)
+    return mock_conn
+
+
+class TestMoveMail:
+
+    # ── guard rails ──────────────────────────────────────────────────────────
+
+    def test_unknown_mailbox_returns_error(self):
+        result = move_mail("no_such", ["1"], "Archive")
+        assert "error" in result
+
+    def test_empty_uids_returns_error(self):
+        result = move_mail("test", [], "Archive")
+        assert "error" in result
+
+    @pytest.mark.parametrize("bad_folder", ["Sent", "Outbox", "Queue", "My Sent Items"])
+    def test_prohibited_folder_rejected(self, bad_folder):
+        result = move_mail("test", ["1"], bad_folder)
+        assert "error" in result
+        assert "prohibited" in result["error"].lower() or "Blocked" in result["error"]
+
+    # ── invalid UIDs ─────────────────────────────────────────────────────────
+
+    def test_all_invalid_uids_no_connection(self):
+        result = move_mail("test", ["abc", "", "0x1"], "Archive")
+        assert "error" not in result
+        assert result["summary"]["invalid"] == 3
+        assert result["summary"]["total"]   == 3
+        assert all(r["status"] == "invalid" for r in result["results"])
+
+    @patch("server.get_conn")
+    def test_mixed_invalid_and_valid(self, mock_get_conn):
+        mock_conn = _make_bulk_conn(
+            ("IMAP4REV1", "MOVE"),
+            [
+                ("OK", [b"101"]),            # pre-check: 101 found, 102 not
+                ("OK", [b"Move done"]),       # MOVE 101
+            ],
+        )
+        mock_get_conn.return_value = mock_conn
+        result = move_mail("test", ["101", "bad", "102"], "Archive")
+        assert result["summary"]["moved"]    == 1
+        assert result["summary"]["not_found"] == 1
+        assert result["summary"]["invalid"]  == 1
+        assert result["summary"]["total"]    == 3
+
+    # ── all not found ─────────────────────────────────────────────────────────
+
+    @patch("server.get_conn")
+    def test_all_uids_not_found(self, mock_get_conn):
+        mock_conn = _make_bulk_conn(
+            ("IMAP4REV1", "MOVE"),
+            [("OK", [b""])],                 # empty search → none found
+        )
+        mock_get_conn.return_value = mock_conn
+        result = move_mail("test", ["101", "102", "103"], "Archive")
+        assert result["summary"]["not_found"] == 3
+        assert result["summary"].get("moved", 0) == 0
+        # No MOVE command should have been issued
+        calls = [c[0][0] for c in mock_conn.uid.call_args_list]
+        assert "MOVE" not in calls
+
+    # ── happy path: MOVE extension ────────────────────────────────────────────
+
+    @patch("server.get_conn")
+    def test_move_all_found_with_move_extension(self, mock_get_conn):
+        mock_conn = _make_bulk_conn(
+            ("IMAP4REV1", "MOVE"),
+            [
+                ("OK", [b"101 102 103"]),    # pre-check
+                ("OK", [b"Move done"]),       # UID MOVE
+            ],
+        )
+        mock_get_conn.return_value = mock_conn
+        result = move_mail("test", ["101", "102", "103"], "Archive")
+        assert result["summary"] == {"total": 3, "moved": 3}
+        assert all(r["status"] == "moved" for r in result["results"])
+        # Verify a single MOVE call was issued with the full UID set
+        move_calls = [c for c in mock_conn.uid.call_args_list
+                      if c[0][0] == "MOVE"]
+        assert len(move_calls) == 1
+        assert "101,102,103" in move_calls[0][0][1]
+
+    @patch("server.get_conn")
+    def test_single_uid_works_like_move_mail(self, mock_get_conn):
+        mock_conn = _make_bulk_conn(
+            ("IMAP4REV1", "MOVE"),
+            [
+                ("OK", [b"42"]),             # pre-check
+                ("OK", [b"Move done"]),       # MOVE
+            ],
+        )
+        mock_get_conn.return_value = mock_conn
+        result = move_mail("test", ["42"], "Archive")
+        assert result["summary"] == {"total": 1, "moved": 1}
+
+    # ── happy path: COPY+EXPUNGE fallback ─────────────────────────────────────
+
+    @patch("server.get_conn")
+    def test_copy_expunge_fallback_all_moved(self, mock_get_conn):
+        mock_conn = _make_bulk_conn(
+            ("IMAP4REV1",),                  # no MOVE capability
+            [
+                ("OK", [b"101 102"]),        # pre-check
+                ("OK", [b"Copy done"]),       # COPY
+                ("OK", [b""]),               # STORE
+            ],
+        )
+        mock_get_conn.return_value = mock_conn
+        result = move_mail("test", ["101", "102"], "Archive")
+        assert result["summary"] == {"total": 2, "moved": 2}
+        mock_conn.expunge.assert_called_once()
+
+    # ── mixed found / not-found ───────────────────────────────────────────────
+
+    @patch("server.get_conn")
+    def test_partial_not_found_preserves_input_order(self, mock_get_conn):
+        mock_conn = _make_bulk_conn(
+            ("IMAP4REV1", "MOVE"),
+            [
+                ("OK", [b"101 103"]),        # pre-check: 102 absent
+                ("OK", [b"Move done"]),       # MOVE 101,103
+            ],
+        )
+        mock_get_conn.return_value = mock_conn
+        result = move_mail("test", ["101", "102", "103"], "Archive")
+        assert result["summary"]["moved"]     == 2
+        assert result["summary"]["not_found"] == 1
+        # Input order must be preserved
+        statuses = [r["status"] for r in result["results"]]
+        assert statuses == ["moved", "not_found", "moved"]
+
+    # ── MOVE command failure paths ─────────────────────────────────────────────
+
+    @patch("server.get_conn")
+    def test_move_fails_all_still_in_source_reports_failed(self, mock_get_conn):
+        mock_conn = _make_bulk_conn(
+            ("IMAP4REV1", "MOVE"),
+            [
+                ("OK", [b"101 102"]),        # pre-check: both found
+                ("NO", [b"Server error"]),    # MOVE fails
+                ("OK", [b"101 102"]),        # post-check: both still in source
+            ],
+        )
+        mock_get_conn.return_value = mock_conn
+        result = move_mail("test", ["101", "102"], "Archive")
+        assert result["summary"] == {"total": 2, "failed": 2}
+        assert all(r["status"] == "failed" for r in result["results"])
+
+    @patch("server.get_conn")
+    def test_move_fails_none_in_source_reports_lost(self, mock_get_conn):
+        mock_conn = _make_bulk_conn(
+            ("IMAP4REV1", "MOVE"),
+            [
+                ("OK", [b"101 102"]),        # pre-check: both found
+                ("NO", [b"Server error"]),    # MOVE fails
+                ("OK", [b""]),               # post-check: neither in source
+            ],
+        )
+        mock_get_conn.return_value = mock_conn
+        result = move_mail("test", ["101", "102"], "Archive")
+        assert result["summary"] == {"total": 2, "lost": 2}
+
+    @patch("server.get_conn")
+    def test_move_fails_partial_post_check_mixed_results(self, mock_get_conn):
+        mock_conn = _make_bulk_conn(
+            ("IMAP4REV1", "MOVE"),
+            [
+                ("OK", [b"101 102 103"]),    # pre-check: all found
+                ("NO", [b"Server error"]),    # MOVE fails
+                ("OK", [b"102"]),            # post-check: only 102 in source
+            ],
+        )
+        mock_get_conn.return_value = mock_conn
+        result = move_mail("test", ["101", "102", "103"], "Archive")
+        assert result["summary"]["failed"] == 1
+        assert result["summary"]["lost"]   == 2
+        uid_status = {r["uid"]: r["status"] for r in result["results"]}
+        assert uid_status["101"] == "lost"
+        assert uid_status["102"] == "failed"
+        assert uid_status["103"] == "lost"
+
+    # ── COPY fallback failure paths ────────────────────────────────────────────
+
+    @patch("server.get_conn")
+    def test_copy_fails_reports_failed_without_post_check(self, mock_get_conn):
+        mock_conn = _make_bulk_conn(
+            ("IMAP4REV1",),                  # no MOVE
+            [
+                ("OK", [b"101 102"]),        # pre-check: both found
+                ("NO", [b"Dest not found"]), # COPY fails
+            ],
+        )
+        mock_get_conn.return_value = mock_conn
+        result = move_mail("test", ["101", "102"], "Nowhere")
+        assert result["summary"] == {"total": 2, "failed": 2}
+        # No EXPUNGE and no post-check search should have been issued
+        mock_conn.expunge.assert_not_called()
+        search_calls = [c for c in mock_conn.uid.call_args_list
+                        if c[0][0] == "search"]
+        assert len(search_calls) == 1  # only the pre-check
+
+    @patch("server.get_conn")
+    def test_copy_ok_expunge_fails_reports_copy_stuck(self, mock_get_conn):
+        mock_conn = _make_bulk_conn(
+            ("IMAP4REV1",),
+            [
+                ("OK", [b"101 102"]),        # pre-check
+                ("OK", [b"Copy done"]),       # COPY ok
+                ("OK", [b""]),               # STORE
+            ],
+            expunge_response=("NO", [b"Expunge failed"]),
+        )
+        mock_get_conn.return_value = mock_conn
+        result = move_mail("test", ["101", "102"], "Archive")
+        assert result["summary"] == {"total": 2, "copy_stuck": 2}
+        assert all("EXPUNGE" in r["detail"].upper() or "expunge" in r["detail"].lower()
+                   for r in result["results"])
+
+    # ── duplicate UIDs ────────────────────────────────────────────────────────
+
+    @patch("server.get_conn")
+    def test_duplicate_uids_collapsed_to_one_result(self, mock_get_conn):
+        mock_conn = _make_bulk_conn(
+            ("IMAP4REV1", "MOVE"),
+            [
+                ("OK", [b"101"]),            # pre-check (101 found once)
+                ("OK", [b"Move done"]),       # MOVE just 101
+            ],
+        )
+        mock_get_conn.return_value = mock_conn
+        result = move_mail("test", ["101", "101", "102"], "Archive")
+        # 101 deduplicated → one result; 102 not found → one result
+        assert len(result["results"]) == 2
+        assert result["summary"] == {"total": 2, "moved": 1, "not_found": 1}
+        # The single MOVE call should contain "101" once
+        move_arg = next(c[0][1] for c in mock_conn.uid.call_args_list
+                        if c[0][0] == "MOVE")
+        assert move_arg == "101"

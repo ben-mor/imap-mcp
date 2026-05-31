@@ -12,7 +12,7 @@ Provides read-only mail access plus folder management (move, mark-as-read).
 | `list_emails` | List recent emails (sender, subject, date, UID, flags) |
 | `get_email` | Fetch full email body by UID (plain text preferred, HTML stripped) |
 | `search_emails` | Search a folder with raw IMAP SEARCH criteria tokens |
-| `move_mail` | Move a message to a folder (send-related folders are blocked) |
+| `move_mail` | Move one or more messages to a folder; per-UID result with status |
 | `mark_as_read` | Set the `\Seen` flag on a message |
 
 ### Dynamic flag fetching
@@ -267,14 +267,6 @@ clean up.
   Useful for binary formats that agents need to process directly: DMARC XML.gz,
   PDFs, ICS calendar files, etc.
 
-- **Bulk same-mailbox move** (`move_mail_bulk`): accept a list of UIDs in a
-  single call instead of one call per message.  Partial failures should be
-  reported per-UID rather than aborting the whole batch:
-
-  ```
-  move_mail_bulk(mailbox, uids: list[str], target_folder, source_folder=None)
-  → { moved: [{ uid }], failed: [{ uid, error }] }
-  ```
 
 - **Bulk cross-mailbox move** (`move_mail_cross_bulk`): the same bulk pattern
   for `move_mail_cross`.  25 mails currently require 25 sequential tool calls;

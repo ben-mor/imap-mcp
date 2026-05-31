@@ -212,6 +212,15 @@ def _check_mailbox(mailbox: str) -> Optional[str]:
     return None
 
 
+def _bulk_summary(results: list[dict]) -> dict:
+    """Count statuses in a per-UID result list and return a summary dict."""
+    counts: dict[str, int] = {}
+    for r in results:
+        s = r["status"]
+        counts[s] = counts.get(s, 0) + 1
+    return {"total": len(results), **counts}
+
+
 # ── Parsing helpers ────────────────────────────────────────────────────────────
 
 # Matches:  (\Flags ...) "sep" "Folder Name"
@@ -681,34 +690,49 @@ def mark_as_read(mailbox: str, uid: str, folder: Optional[str] = None) -> dict:
 @mcp.tool()
 def move_mail(
     mailbox:       str,
-    uid:           str,
+    uids:          list[str],
     target_folder: str,
     source_folder: Optional[str] = None,
 ) -> dict:
     """
-    Move an email to a different folder within the same mailbox account.
+    Move one or more emails to a folder within the same mailbox account.
 
-    For moves between different accounts use move_mail_cross.
-    Folders matching a prohibited pattern (Sent, Outbox, Queue by default)
-    are rejected to prevent accidental mail delivery.
+    Accepts 1–N UIDs in a single call.  Existing UIDs are moved with a single
+    IMAP command (UID MOVE uid-set, or COPY+STORE+EXPUNGE on servers without
+    MOVE); each UID is reported individually so partial failures are visible.
 
-    Attempts the atomic RFC 6851 MOVE command first; falls back to
-    COPY + \\Deleted + EXPUNGE when the server does not advertise MOVE.
-
-    A UID SEARCH pre-check guards against the silent OK that IMAP servers
-    return for non-existent UIDs.
+    Duplicate UIDs in the input list are collapsed to a single result entry.
 
     Args:
         mailbox:       Account name (see list_mailboxes).
-        uid:           IMAP UID of the message.
+        uids:          List of IMAP UIDs to move (positive integer strings).
         target_folder: Destination folder name.
-        source_folder: Source folder. Defaults to account default.
+        source_folder: Source folder.  Defaults to account default.
+
+    Returns a dict with keys:
+      results  – list of per-UID dicts (in input order), each with:
+                   uid     – the UID as supplied
+                   status  – one of:
+                     "moved"          successfully moved to target_folder
+                     "not_found"      UID was not in source_folder before the move
+                     "failed"         move attempted but message confirmed still
+                                      in source (nothing changed — safe to retry)
+                     "lost"           move attempted, message gone from source and
+                                      cannot be confirmed in destination (check
+                                      target_folder manually)
+                     "copy_stuck"     COPY succeeded but EXPUNGE failed; message
+                                      exists in both folders (marked \\\\Deleted in
+                                      source — run EXPUNGE manually to clean up)
+                     "invalid"        UID is not a positive integer string
+                   detail  – human-readable explanation (omitted when status is
+                              "moved")
+      summary  – {"total": N, "<status>": count, ...}
     """
     err = _check_mailbox(mailbox)
     if err:
         return {"error": err}
-    if not _valid_uid(uid):
-        return {"error": f"Invalid UID: {uid!r}"}
+    if not uids:
+        return {"error": "uids must not be empty"}
     if _is_prohibited(target_folder, _prohibited_patterns(mailbox)):
         return {
             "error": (
@@ -717,6 +741,29 @@ def move_mail(
             )
         }
 
+    # ── Phase 1: validate UID format ──────────────────────────────────────────
+    # per_uid: first-occurrence result entry; None = valid but not yet resolved.
+    per_uid:    dict[str, Optional[dict]] = {}
+    valid_uids: list[str]                 = []  # deduped, format-valid, input order
+
+    for uid in uids:
+        if uid in per_uid:
+            continue                    # collapse duplicates
+        if not _valid_uid(uid):
+            per_uid[uid] = {
+                "uid":    uid,
+                "status": "invalid",
+                "detail": "UID must be a positive integer string",
+            }
+        else:
+            valid_uids.append(uid)
+            per_uid[uid] = None         # placeholder
+
+    if not valid_uids:
+        results = [per_uid[u] for u in dict.fromkeys(uids)]
+        return {"results": results, "summary": _bulk_summary(results)}
+
+    # ── Phase 2: open folder, pre-check which UIDs exist ─────────────────────
     conn = get_conn(mailbox)
     src  = source_folder or _default_folder(mailbox)
 
@@ -724,22 +771,100 @@ def move_mail(
     if typ != "OK":
         return {"error": f"Cannot open source folder: {src}"}
 
-    typ, exists = conn.uid("search", None, f"UID {uid}")
-    if typ != "OK" or not exists[0].strip():
-        return {"error": f"UID {uid} not found in {src}"}
+    uid_set_str = ",".join(valid_uids)
+    typ, data   = conn.uid("search", None, f"UID {uid_set_str}")
+
+    found_set: set[str] = set()
+    if typ == "OK" and data and data[0]:
+        found_set = set(data[0].decode("ascii", errors="replace").split())
+
+    for uid in valid_uids:
+        if uid not in found_set:
+            per_uid[uid] = {
+                "uid":    uid,
+                "status": "not_found",
+                "detail": f"UID not present in {src}",
+            }
+
+    found_list = [uid for uid in valid_uids if uid in found_set]
+
+    if not found_list:
+        results = [per_uid[u] for u in dict.fromkeys(uids)]
+        return {"results": results, "summary": _bulk_summary(results)}
+
+    # ── Phase 3: move all found UIDs in one IMAP command ─────────────────────
+    move_uid_set = ",".join(found_list)
+    copy_failed  = False
+    copy_stuck   = False
 
     if "MOVE" in conn.capabilities:
-        typ, _ = conn.uid("MOVE", uid, _q(target_folder))
-        if typ == "OK":
-            return {"success": True, "uid": uid, "moved_to": target_folder}
-        return {"error": f"MOVE command failed for UID {uid}"}
+        typ, _ = conn.uid("MOVE", move_uid_set, _q(target_folder))
+        move_ok = (typ == "OK")
+    else:
+        typ, _ = conn.uid("copy", move_uid_set, _q(target_folder))
+        if typ != "OK":
+            move_ok     = False
+            copy_failed = True
+        else:
+            conn.uid("store", move_uid_set, "+FLAGS", "\\Deleted")
+            typ, _    = conn.expunge()
+            move_ok   = (typ == "OK")
+            copy_stuck = not move_ok
 
-    typ, _ = conn.uid("copy", uid, _q(target_folder))
-    if typ != "OK":
-        return {"error": f"COPY to '{target_folder}' failed — folder may not exist"}
-    conn.uid("store", uid, "+FLAGS", "\\Deleted")
-    conn.expunge()
-    return {"success": True, "uid": uid, "moved_to": target_folder}
+    # ── Phase 4: classify results ─────────────────────────────────────────────
+    if move_ok:
+        for uid in found_list:
+            per_uid[uid] = {"uid": uid, "status": "moved"}
+
+    elif copy_failed:
+        for uid in found_list:
+            per_uid[uid] = {
+                "uid":    uid,
+                "status": "failed",
+                "detail": (
+                    f"COPY to '{target_folder}' failed; "
+                    "message remains in source unchanged"
+                ),
+            }
+
+    elif copy_stuck:
+        for uid in found_list:
+            per_uid[uid] = {
+                "uid":    uid,
+                "status": "copy_stuck",
+                "detail": (
+                    f"Copied to '{target_folder}' but EXPUNGE failed; message "
+                    f"exists in both folders (marked \\Deleted in {src})"
+                ),
+            }
+
+    else:
+        # MOVE command failed — post-check to distinguish failed vs lost
+        typ2, data2 = conn.uid("search", None, f"UID {move_uid_set}")
+        still_in_src: set[str] = set()
+        if typ2 == "OK" and data2 and data2[0]:
+            still_in_src = set(data2[0].decode("ascii", errors="replace").split())
+
+        for uid in found_list:
+            if uid in still_in_src:
+                per_uid[uid] = {
+                    "uid":    uid,
+                    "status": "failed",
+                    "detail": "Move command failed; message confirmed in source",
+                }
+            else:
+                per_uid[uid] = {
+                    "uid":    uid,
+                    "status": "lost",
+                    "detail": (
+                        "Move command failed and message is no longer in source — "
+                        f"check '{target_folder}' manually; it may have arrived "
+                        "there under a new UID, or been removed by another client"
+                    ),
+                }
+
+    results = [per_uid[u] for u in dict.fromkeys(uids)]
+    return {"results": results, "summary": _bulk_summary(results)}
 
 
 @mcp.tool()
