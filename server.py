@@ -870,38 +870,59 @@ def move_mail(
 @mcp.tool()
 def move_mail_cross(
     src_mailbox: str,
-    uid:         str,
+    uids:        list[str],
     src_folder:  str,
     dst_mailbox: str,
     dst_folder:  str,
 ) -> dict:
     """
-    Move an email from one mailbox account to another.
+    Move one or more emails from one mailbox account to another.
 
-    IMAP has no native cross-server move.  This tool fetches the raw message
-    (RFC822), APPENDs it to the destination folder, then deletes the original.
+    IMAP has no native cross-server move.  This tool fetches raw messages
+    (RFC822) from the source in a single batch command, APPENDs them to the
+    destination one by one (APPEND is not batchable), then deletes the
+    originals with a single batch delete command.
 
-    Failure handling:
-      • APPEND fails  → original is untouched; error returned.
-      • DELETE fails  → message exists in both places; error returned with
-                        new_uid so the duplicate can be cleaned up.
+    Duplicate UIDs in the input list are collapsed to a single result entry.
+
+    Failure handling per UID:
+      • not_found  → UID absent from source before fetch; original untouched.
+      • failed     → APPEND to destination failed; original untouched.
+      • copy_stuck → APPEND succeeded but delete failed and message confirmed
+                     still in source (exists in both folders; marked \\Deleted
+                     in source — run EXPUNGE manually to clean up).
+      • moved      → Successfully moved (or gone from source after delete
+                     failure — effectively moved).
+
+    Timing window: the pre-check and the batch fetch are separate IMAP
+    commands.  A message deleted by another client *after* the pre-check but
+    *before* the fetch is still fetched and appended to the destination —
+    it will be reported as "moved" even though it was concurrently deleted on
+    the source.  This is an inherent race in the FETCH→APPEND→DELETE sequence
+    and cannot be closed without server-side atomic move support.
 
     Args:
         src_mailbox: Source account name (see list_mailboxes).
-        uid:         IMAP UID of the message in the source account.
+        uids:        List of IMAP UIDs in the source account.
         src_folder:  Source folder name.
         dst_mailbox: Destination account name.
         dst_folder:  Destination folder name.
 
-    Returns a dict with keys on success:
-      success, src_mailbox, src_folder, src_uid, dst_mailbox, dst_folder,
-      new_uid (present when the server returns an APPENDUID response code).
+    Returns a dict with keys:
+      results  – list of per-UID dicts (in input order), each with:
+                   uid     – the UID as supplied
+                   status  – one of: moved | not_found | failed | copy_stuck
+                             | invalid
+                   new_uid – UID assigned in destination (when APPENDUID
+                             response available)
+                   detail  – human-readable explanation (omitted on "moved")
+      summary  – {"total": N, "<status>": count, ...}
     """
     err = _check_mailbox(src_mailbox) or _check_mailbox(dst_mailbox)
     if err:
         return {"error": err}
-    if not _valid_uid(uid):
-        return {"error": f"Invalid UID: {uid!r}"}
+    if not uids:
+        return {"error": "uids must not be empty"}
     if _is_prohibited(dst_folder, _prohibited_patterns(dst_mailbox)):
         return {
             "error": (
@@ -910,6 +931,28 @@ def move_mail_cross(
             )
         }
 
+    # ── Phase 1: validate UID format ──────────────────────────────────────────
+    per_uid:    dict[str, Optional[dict]] = {}
+    valid_uids: list[str]                 = []
+
+    for uid in uids:
+        if uid in per_uid:
+            continue
+        if not _valid_uid(uid):
+            per_uid[uid] = {
+                "uid":    uid,
+                "status": "invalid",
+                "detail": "UID must be a positive integer string",
+            }
+        else:
+            valid_uids.append(uid)
+            per_uid[uid] = None
+
+    if not valid_uids:
+        results = [per_uid[u] for u in dict.fromkeys(uids)]
+        return {"results": results, "summary": _bulk_summary(results)}
+
+    # ── Phase 2: open source folder, pre-check which UIDs exist ──────────────
     src_conn = get_conn(src_mailbox)
     dst_conn = get_conn(dst_mailbox)
 
@@ -917,53 +960,134 @@ def move_mail_cross(
     if typ != "OK":
         return {"error": f"Cannot open source folder: {src_folder}"}
 
-    typ, exists = src_conn.uid("search", None, f"UID {uid}")
-    if typ != "OK" or not exists[0].strip():
-        return {"error": f"UID {uid} not found in {src_mailbox}/{src_folder}"}
+    uid_set_str = ",".join(valid_uids)
+    typ, data   = src_conn.uid("search", None, f"UID {uid_set_str}")
 
-    # Fetch raw message bytes.
-    typ, fetch_data = src_conn.uid("fetch", uid, "(RFC822)")
-    if typ != "OK" or not fetch_data or not isinstance(fetch_data[0], tuple):
-        return {"error": f"Failed to fetch UID {uid} from {src_mailbox}"}
-    raw_message: bytes = fetch_data[0][1]
+    found_set: set[str] = set()
+    if typ == "OK" and data and data[0]:
+        found_set = set(data[0].decode("ascii", errors="replace").split())
 
-    # Append to destination — if this fails the original is untouched.
-    typ, append_data = dst_conn.append(_q(dst_folder), None, None, raw_message)
-    if typ != "OK":
-        return {
-            "error": (
-                f"APPEND to {dst_mailbox}/{dst_folder} failed — "
-                "original message is untouched."
-            )
-        }
+    for uid in valid_uids:
+        if uid not in found_set:
+            per_uid[uid] = {
+                "uid":    uid,
+                "status": "not_found",
+                "detail": f"UID not present in {src_mailbox}/{src_folder}",
+            }
 
-    new_uid = _parse_appenduid(append_data)
+    found_list = [uid for uid in valid_uids if uid in found_set]
 
-    # Delete from source.
-    src_conn.uid("store", uid, "+FLAGS", "\\Deleted")
-    typ, _ = src_conn.expunge()
-    if typ != "OK":
-        result: dict = {
-            "error": (
-                f"Message was copied to {dst_mailbox}/{dst_folder} but "
-                f"could not be deleted from {src_mailbox}/{src_folder}. "
-                "Delete the original manually."
-            ),
-            "src_mailbox": src_mailbox, "src_folder": src_folder, "src_uid": uid,
-            "dst_mailbox": dst_mailbox, "dst_folder": dst_folder,
-        }
-        if new_uid:
-            result["new_uid"] = new_uid
-        return result
+    if not found_list:
+        results = [per_uid[u] for u in dict.fromkeys(uids)]
+        return {"results": results, "summary": _bulk_summary(results)}
 
-    result = {
-        "success":    True,
-        "src_mailbox": src_mailbox, "src_folder": src_folder, "src_uid": uid,
-        "dst_mailbox": dst_mailbox, "dst_folder": dst_folder,
-    }
-    if new_uid:
-        result["new_uid"] = new_uid
-    return result
+    # ── Phase 3: batch-fetch all found messages ───────────────────────────────
+    fetch_uid_set   = ",".join(found_list)
+    typ, fetch_data = src_conn.uid("fetch", fetch_uid_set, "(RFC822)")
+
+    if typ != "OK" or not fetch_data:
+        for uid in found_list:
+            per_uid[uid] = {
+                "uid":    uid,
+                "status": "not_found",
+                "detail": f"FETCH from {src_mailbox}/{src_folder} failed",
+            }
+        results = [per_uid[u] for u in dict.fromkeys(uids)]
+        return {"results": results, "summary": _bulk_summary(results)}
+
+    # Parse fetch response: build src_uid → raw_bytes mapping.
+    # imaplib returns a flat list of (info_bytes, msg_bytes) tuples interleaved
+    # with literal b")" separators — skip non-tuples.
+    raw_by_uid: dict[str, bytes] = {}
+    for item in fetch_data:
+        if not isinstance(item, tuple) or len(item) < 2:
+            continue
+        info  = item[0].decode("utf-8", errors="replace") if isinstance(item[0], bytes) else str(item[0])
+        uid_m = re.search(r"UID (\d+)", info)
+        if uid_m:
+            raw_by_uid[uid_m.group(1)] = item[1]
+
+    for uid in found_list:
+        if uid not in raw_by_uid:
+            per_uid[uid] = {
+                "uid":    uid,
+                "status": "not_found",
+                "detail": f"UID {uid} missing from FETCH response",
+            }
+
+    fetchable = [uid for uid in found_list if uid in raw_by_uid]
+
+    if not fetchable:
+        results = [per_uid[u] for u in dict.fromkeys(uids)]
+        return {"results": results, "summary": _bulk_summary(results)}
+
+    # ── Phase 4: APPEND each message to destination (not batchable) ──────────
+    appended_uids: list[str] = []   # src UIDs successfully APPENDed
+
+    for uid in fetchable:
+        typ2, append_data = dst_conn.append(_q(dst_folder), None, None, raw_by_uid[uid])
+        if typ2 != "OK":
+            per_uid[uid] = {
+                "uid":    uid,
+                "status": "failed",
+                "detail": (
+                    f"APPEND to {dst_mailbox}/{dst_folder} failed; "
+                    "original message is untouched"
+                ),
+            }
+        else:
+            entry: dict = {"uid": uid, "status": "_appended"}  # resolved in Phase 5
+            new_uid = _parse_appenduid(append_data)
+            if new_uid:
+                entry["new_uid"] = new_uid
+            per_uid[uid] = entry
+            appended_uids.append(uid)
+
+    if not appended_uids:
+        results = [per_uid[u] for u in dict.fromkeys(uids)]
+        return {"results": results, "summary": _bulk_summary(results)}
+
+    # ── Phase 5: batch-delete appended originals from source ─────────────────
+    delete_uid_set = ",".join(appended_uids)
+    src_conn.uid("store", delete_uid_set, "+FLAGS", "\\Deleted")
+    typ3, _ = src_conn.expunge()
+
+    if typ3 == "OK":
+        for uid in appended_uids:
+            entry  = per_uid[uid]
+            result = {"uid": uid, "status": "moved"}
+            if "new_uid" in entry:
+                result["new_uid"] = entry["new_uid"]
+            per_uid[uid] = result
+    else:
+        # Delete failed — check each UID individually in source to distinguish
+        # copy_stuck (still in src) from moved (gone from src despite error).
+        typ4, search_data = src_conn.uid("search", None, f"UID {delete_uid_set}")
+        still_in_src: set[str] = set()
+        if typ4 == "OK" and search_data and search_data[0]:
+            still_in_src = set(search_data[0].decode("ascii", errors="replace").split())
+
+        for uid in appended_uids:
+            entry  = per_uid[uid]
+            new_uid = entry.get("new_uid")
+            if uid in still_in_src:
+                r: dict = {
+                    "uid":    uid,
+                    "status": "copy_stuck",
+                    "detail": (
+                        f"Copied to {dst_mailbox}/{dst_folder} but EXPUNGE failed; "
+                        f"message exists in both folders (marked \\Deleted in "
+                        f"{src_mailbox}/{src_folder})"
+                    ),
+                }
+            else:
+                r = {"uid": uid, "status": "moved"}
+            if new_uid:
+                r["new_uid"] = new_uid
+            per_uid[uid] = r
+
+    results = [per_uid[u] for u in dict.fromkeys(uids)]
+    return {"results": results, "summary": _bulk_summary(results)}
 
 
 # ── MCP Tools — Rules ──────────────────────────────────────────────────────────

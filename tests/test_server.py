@@ -588,51 +588,229 @@ class TestMarkAsRead:
 
 # ── Tool: move_mail_cross ──────────────────────────────────────────────────────
 
+def _make_cross_src_conn(uid_responses, expunge_response=("OK", [b""])):
+    """Return a MagicMock src IMAP connection wired for move_mail_cross tests."""
+    src_conn = MagicMock()
+    src_conn.select.return_value = ("OK", [b"5"])
+    src_conn.expunge.return_value = expunge_response
+    responses = iter(uid_responses)
+    src_conn.uid.side_effect = lambda *a, **kw: next(responses)
+    return src_conn
+
+
 class TestMoveMailCross:
-    @patch("server.get_conn")
-    def test_happy_day_cross_mailbox(self, mock_get_conn):
-        # Add a second mailbox config for this test
+
+    def _setup_mailboxes(self):
         import server as srv
-        srv._mailbox_configs["test2"] = {**srv._mailbox_configs["test"],
-                                          "host": "imap2.test.example"}
+        srv._mailbox_configs["test2"] = {
+            **srv._mailbox_configs["test"],
+            "host": "imap2.test.example",
+        }
 
-        src_conn = MagicMock()
-        dst_conn = MagicMock()
-
-        def get_conn_side_effect(mailbox):
-            return src_conn if mailbox == "test" else dst_conn
-
-        mock_get_conn.side_effect = get_conn_side_effect
-        src_conn.select.return_value = ("OK", [b"1"])
-
-        def src_uid(command, *args):
-            if command == "search": return ("OK", [b"42"])
-            if command == "fetch":  return ("OK", [(b"1 (UID 42 RFC822 {4}", b"data"), b")"])
-            return ("OK", [b""])
-
-        src_conn.uid.side_effect = src_uid
-        dst_conn.append.return_value = ("OK", [b"[APPENDUID 1620000000 99] Done"])
-        src_conn.expunge.return_value = ("OK", [b""])
-
-        result = move_mail_cross("test", "42", "INBOX", "test2", "Archive")
-        assert result["success"] is True
-        assert result["new_uid"] == "99"
-        assert result["src_uid"] == "42"
-        dst_conn.append.assert_called_once()
+    # ── guard rails ──────────────────────────────────────────────────────────
 
     def test_unknown_src_mailbox(self):
-        result = move_mail_cross("no_such", "42", "INBOX", "test", "Archive")
+        result = move_mail_cross("no_such", ["42"], "INBOX", "test", "Archive")
         assert "error" in result
 
     def test_unknown_dst_mailbox(self):
-        result = move_mail_cross("test", "42", "INBOX", "no_such", "Archive")
+        result = move_mail_cross("test", ["42"], "INBOX", "no_such", "Archive")
+        assert "error" in result
+
+    def test_empty_uids_returns_error(self):
+        self._setup_mailboxes()
+        result = move_mail_cross("test", [], "INBOX", "test2", "Archive")
         assert "error" in result
 
     def test_prohibited_dst_folder(self):
-        import server as srv
-        srv._mailbox_configs["test2"] = {**srv._mailbox_configs["test"]}
-        result = move_mail_cross("test", "42", "INBOX", "test2", "Sent")
+        self._setup_mailboxes()
+        result = move_mail_cross("test", ["42"], "INBOX", "test2", "Sent")
         assert "error" in result and "prohibited" in result["error"].lower()
+
+    def test_invalid_uid(self):
+        self._setup_mailboxes()
+        result = move_mail_cross("test", ["not-a-uid"], "INBOX", "test2", "Archive")
+        assert result["summary"]["invalid"] == 1
+        assert result["results"][0]["status"] == "invalid"
+
+    # ── not_found ─────────────────────────────────────────────────────────────
+
+    @patch("server.get_conn")
+    def test_uid_not_found_in_source(self, mock_get_conn):
+        self._setup_mailboxes()
+        src_conn = _make_cross_src_conn([("OK", [b""])])   # pre-check: absent
+        dst_conn = MagicMock()
+        mock_get_conn.side_effect = lambda mb: src_conn if mb == "test" else dst_conn
+
+        result = move_mail_cross("test", ["42"], "INBOX", "test2", "Archive")
+        assert result["summary"]["not_found"] == 1
+        dst_conn.append.assert_not_called()
+
+    # ── happy path ────────────────────────────────────────────────────────────
+
+    @patch("server.get_conn")
+    def test_happy_day_single_uid(self, mock_get_conn):
+        self._setup_mailboxes()
+        src_conn = _make_cross_src_conn([
+            ("OK", [b"42"]),                                             # pre-check
+            ("OK", [(b"1 (UID 42 RFC822 {4}", b"data"), b")"]),          # fetch
+            ("OK", [b""]),                                               # store
+        ])
+        dst_conn = MagicMock()
+        mock_get_conn.side_effect = lambda mb: src_conn if mb == "test" else dst_conn
+        dst_conn.append.return_value = ("OK", [b"[APPENDUID 1620000000 99] Done"])
+
+        result = move_mail_cross("test", ["42"], "INBOX", "test2", "Archive")
+        assert result["summary"] == {"total": 1, "moved": 1}
+        assert result["results"][0]["status"] == "moved"
+        assert result["results"][0].get("new_uid") == "99"
+        dst_conn.append.assert_called_once()
+
+    @patch("server.get_conn")
+    def test_happy_day_multiple_uids(self, mock_get_conn):
+        self._setup_mailboxes()
+        src_conn = _make_cross_src_conn([
+            ("OK", [b"41 42"]),                                          # pre-check
+            ("OK", [                                                      # fetch both
+                (b"1 (UID 41 RFC822 {5}", b"data1"), b")",
+                (b"2 (UID 42 RFC822 {5}", b"data2"), b")",
+            ]),
+            ("OK", [b""]),                                               # store
+        ])
+        dst_conn = MagicMock()
+        mock_get_conn.side_effect = lambda mb: src_conn if mb == "test" else dst_conn
+        dst_conn.append.return_value = ("OK", [b"[APPENDUID 1620000000 100] Done"])
+
+        result = move_mail_cross("test", ["41", "42"], "INBOX", "test2", "Archive")
+        assert result["summary"] == {"total": 2, "moved": 2}
+        assert dst_conn.append.call_count == 2
+
+    # ── APPEND failure ────────────────────────────────────────────────────────
+
+    @patch("server.get_conn")
+    def test_append_fails_reports_failed(self, mock_get_conn):
+        self._setup_mailboxes()
+        src_conn = _make_cross_src_conn([
+            ("OK", [b"42"]),
+            ("OK", [(b"1 (UID 42 RFC822 {4}", b"data"), b")"]),
+        ])
+        dst_conn = MagicMock()
+        mock_get_conn.side_effect = lambda mb: src_conn if mb == "test" else dst_conn
+        dst_conn.append.return_value = ("NO", [b"Permission denied"])
+
+        result = move_mail_cross("test", ["42"], "INBOX", "test2", "Archive")
+        assert result["summary"]["failed"] == 1
+        src_conn.expunge.assert_not_called()
+
+    @patch("server.get_conn")
+    def test_partial_append_failure(self, mock_get_conn):
+        self._setup_mailboxes()
+        src_conn = _make_cross_src_conn([
+            ("OK", [b"41 42"]),
+            ("OK", [                                                      # fetch both
+                (b"1 (UID 41 RFC822 {5}", b"data1"), b")",
+                (b"2 (UID 42 RFC822 {5}", b"data2"), b")",
+            ]),
+            ("OK", [b""]),                                               # store (41 only)
+        ])
+        dst_conn = MagicMock()
+        mock_get_conn.side_effect = lambda mb: src_conn if mb == "test" else dst_conn
+        dst_conn.append.side_effect = [
+            ("OK",  [b"[APPENDUID 1620000000 100] Done"]),   # 41 ok
+            ("NO",  [b"Server error"]),                       # 42 fails
+        ]
+
+        result = move_mail_cross("test", ["41", "42"], "INBOX", "test2", "Archive")
+        assert result["summary"]["moved"]  == 1
+        assert result["summary"]["failed"] == 1
+
+    # ── delete failure → post-check ───────────────────────────────────────────
+
+    @patch("server.get_conn")
+    def test_delete_fails_still_in_src_reports_copy_stuck(self, mock_get_conn):
+        self._setup_mailboxes()
+        src_conn = _make_cross_src_conn(
+            [
+                ("OK", [b"42"]),                                          # pre-check
+                ("OK", [(b"1 (UID 42 RFC822 {4}", b"data"), b")"]),       # fetch
+                ("OK", [b""]),                                            # store
+                ("OK", [b"42"]),                                          # post-check: still there
+            ],
+            expunge_response=("NO", [b"Expunge failed"]),
+        )
+        dst_conn = MagicMock()
+        mock_get_conn.side_effect = lambda mb: src_conn if mb == "test" else dst_conn
+        dst_conn.append.return_value = ("OK", [b"[APPENDUID 1620000000 99] Done"])
+
+        result = move_mail_cross("test", ["42"], "INBOX", "test2", "Archive")
+        assert result["summary"]["copy_stuck"] == 1
+        assert result["results"][0]["new_uid"] == "99"
+
+    @patch("server.get_conn")
+    def test_delete_fails_gone_from_src_reports_moved(self, mock_get_conn):
+        self._setup_mailboxes()
+        src_conn = _make_cross_src_conn(
+            [
+                ("OK", [b"42"]),                                          # pre-check
+                ("OK", [(b"1 (UID 42 RFC822 {4}", b"data"), b")"]),       # fetch
+                ("OK", [b""]),                                            # store
+                ("OK", [b""]),                                            # post-check: gone
+            ],
+            expunge_response=("NO", [b"Expunge failed"]),
+        )
+        dst_conn = MagicMock()
+        mock_get_conn.side_effect = lambda mb: src_conn if mb == "test" else dst_conn
+        dst_conn.append.return_value = ("OK", [b"[APPENDUID 1620000000 99] Done"])
+
+        result = move_mail_cross("test", ["42"], "INBOX", "test2", "Archive")
+        assert result["summary"]["moved"] == 1
+        assert result["results"][0]["status"] == "moved"
+        assert result["results"][0].get("new_uid") == "99"
+
+    @patch("server.get_conn")
+    def test_delete_fails_mixed_post_check(self, mock_get_conn):
+        self._setup_mailboxes()
+        src_conn = _make_cross_src_conn(
+            [
+                ("OK", [b"41 42"]),                                       # pre-check: both found
+                ("OK", [                                                   # fetch
+                    (b"1 (UID 41 RFC822 {5}", b"data1"), b")",
+                    (b"2 (UID 42 RFC822 {5}", b"data2"), b")",
+                ]),
+                ("OK", [b""]),                                            # store
+                ("OK", [b"42"]),                                          # post-check: only 42 still there
+            ],
+            expunge_response=("NO", [b"Expunge failed"]),
+        )
+        dst_conn = MagicMock()
+        mock_get_conn.side_effect = lambda mb: src_conn if mb == "test" else dst_conn
+        dst_conn.append.return_value = ("OK", [b"[APPENDUID 1620000000 100] Done"])
+
+        result = move_mail_cross("test", ["41", "42"], "INBOX", "test2", "Archive")
+        assert result["summary"]["moved"]      == 1
+        assert result["summary"]["copy_stuck"] == 1
+        uid_status = {r["uid"]: r["status"] for r in result["results"]}
+        assert uid_status["41"] == "moved"
+        assert uid_status["42"] == "copy_stuck"
+
+    # ── duplicate UIDs ────────────────────────────────────────────────────────
+
+    @patch("server.get_conn")
+    def test_duplicate_uids_collapsed(self, mock_get_conn):
+        self._setup_mailboxes()
+        src_conn = _make_cross_src_conn([
+            ("OK", [b"42"]),
+            ("OK", [(b"1 (UID 42 RFC822 {4}", b"data"), b")"]),
+            ("OK", [b""]),
+        ])
+        dst_conn = MagicMock()
+        mock_get_conn.side_effect = lambda mb: src_conn if mb == "test" else dst_conn
+        dst_conn.append.return_value = ("OK", [b"[APPENDUID 1620000000 99] Done"])
+
+        result = move_mail_cross("test", ["42", "42"], "INBOX", "test2", "Archive")
+        assert len(result["results"]) == 1
+        assert result["summary"] == {"total": 1, "moved": 1}
+        dst_conn.append.assert_called_once()
 
 
 # ── Tool: search_emails ────────────────────────────────────────────────────────
